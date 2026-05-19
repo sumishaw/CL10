@@ -68,21 +68,22 @@ class SpeechCaptureService : Service() {
         private const val WHISPER_URL    = "http://127.0.0.1:8765/transcribe"
         private const val WHISPER_HEALTH = "http://127.0.0.1:8765/health"
 
-        // 3s chunks — base model processes in ~3s on Dimensity 7050
-        // Medium model measured at 64s/chunk — completely unusable on this CPU
-        private const val CHUNK_SECS    = 3.0
-        private const val CHUNK_SAMPLES = (SAMPLE_RATE * CHUNK_SECS).toInt()  // 48 000
-        private const val CHUNK_BYTES   = CHUNK_SAMPLES * 2                   // 96 000
+        // 4s chunks — small model processes in ~8-10s on Dimensity 7050 (4 threads).
+        // 4s chunks give more sentence context than 3s → better translation quality.
+        // Queue depth stays at 2-3 max, lag stays under ~20s.
+        private const val CHUNK_SECS    = 4.0
+        private const val CHUNK_SAMPLES = (SAMPLE_RATE * CHUNK_SECS).toInt()  // 64 000
+        private const val CHUNK_BYTES   = CHUNK_SAMPLES * 2                   // 128 000
 
-        private const val QUEUE_CAPACITY = 4
+        private const val QUEUE_CAPACITY = 3
 
-        // base model actual: ~10s Whisper + ~0.5s CT2 = ~10.5s + 7.5s margin = 18s
-        private const val STALE_MS           = 18_000L
+        // small model: ~10s Whisper + ~0.3s CT2 + 12s margin = 22s
+        private const val STALE_MS           = 22_000L
         private const val CONNECT_TIMEOUT_MS = 2_000
-        private const val READ_TIMEOUT_MS    = 18_000
+        private const val READ_TIMEOUT_MS    = 22_000
 
         private const val MAX_CONSECUTIVE_ERRORS = 5
-        private const val WATCHDOG_TIMEOUT_MS    = 25_000L
+        private const val WATCHDOG_TIMEOUT_MS    = 35_000L
         private const val MAX_BACKOFF_MS         = 8_000L
     }
 
