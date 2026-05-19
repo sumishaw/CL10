@@ -184,32 +184,36 @@ class OverlayService : Service() {
 
     private fun buildOverlay() {
         try {
-            // Root container
+            // Root container — NO background, transparent, text only
             val container = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
-                setBackgroundColor(Color.parseColor("#CC000000"))  // semi-transparent black
-                setPadding(dp(12), dp(6), dp(12), dp(6))
+                // No background — pure transparent, text floats over video
+                setBackgroundColor(Color.TRANSPARENT)
+                setPadding(dp(16), dp(4), dp(16), dp(4))
             }
 
-            // Source language text (small, grey)
+            // Source language text (small, light grey, strong shadow for readability)
             srcTv = TextView(this).apply {
-                text      = ""
-                typeface  = Typeface.DEFAULT
-                setTextColor(Color.parseColor("#BBBBBB"))
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-                maxLines  = 2
-                setShadowLayer(4f, 1f, 1f, Color.BLACK)
+                text     = ""
+                typeface = Typeface.DEFAULT
+                setTextColor(Color.parseColor("#DDDDDD"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                maxLines = 2
+                // Strong multi-layer shadow so text is readable over any background
+                setShadowLayer(8f, 0f, 0f, Color.BLACK)
+                paint.isFakeBoldText = false
             }
 
-            // Hindi translation (large, white, bold)
+            // Hindi translation — large, bright white, very strong shadow
             hindiTv = TextView(this).apply {
-                text      = ""
-                typeface  = Typeface.DEFAULT_BOLD
+                text     = ""
+                typeface = Typeface.DEFAULT_BOLD
                 setTextColor(Color.WHITE)
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f)
-                setLineSpacing(0f, 1.15f)
-                maxLines  = 3
-                setShadowLayer(10f, 1f, 1f, Color.BLACK)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 24f)
+                setLineSpacing(dp(2).toFloat(), 1f)
+                maxLines = 3
+                // Thick black shadow gives outline effect — readable on any background
+                setShadowLayer(12f, 0f, 0f, Color.BLACK)
             }
 
             container.addView(srcTv,   LinearLayout.LayoutParams(
