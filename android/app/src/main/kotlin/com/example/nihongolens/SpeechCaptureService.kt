@@ -244,13 +244,33 @@ class SpeechCaptureService : Service() {
         }
         audioRecord = ar
         chunksSentThisSession.set(0)
-        lastPushedHindi = ""
+        lastPushedHindi = ""   // clear so previous session subtitle never re-shows
         audioQueue.clear()
 
         capturing.set(true)
         ar.startRecording()
         updateNotification("Translating video audio to Hindi…")
-        OverlayService.updateText("", "Listening to video audio…")
+
+        // Clear any leftover subtitle from previous session immediately
+        mainHandler.post {
+            OverlayService.updateText("", "")
+        }
+
+        // Reset server language cache — prevents previous session's language
+        // from bleeding into this session
+        Thread({
+            try {
+                val conn = URL("http://127.0.0.1:8765/reset").openConnection() as HttpURLConnection
+                conn.requestMethod = "GET"
+                conn.connectTimeout = 2_000
+                conn.readTimeout    = 2_000
+                conn.responseCode   // trigger request
+                conn.disconnect()
+                Log.d(TAG, "Server session reset successful")
+            } catch (e: Exception) {
+                Log.d(TAG, "Server reset call failed (non-critical): ${e.message}")
+            }
+        }, "ResetThread").apply { isDaemon = true; start() }
 
         captureThread = Thread({
             val window  = ByteArray(CHUNK_BYTES)
