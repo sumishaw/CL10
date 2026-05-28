@@ -181,7 +181,7 @@ class LiveCaptionReader : AccessibilityService() {
         // Reject locale strings like "English (United States)"
         if (text.matches(Regex(".*\\(.*\\).*")) && text.length < 50) return false
         // Reject very short English fragments (single/double words) — UI noise
-        val isAllAscii = text.all { it.isAscii() }
+        val isAllAscii = text.all { it.code < 128 }
         if (isAllAscii && text.split(" ").size <= 2 && text.length < 15) return false
         return true
     }
