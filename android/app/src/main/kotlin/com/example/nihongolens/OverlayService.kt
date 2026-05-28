@@ -133,15 +133,18 @@ class OverlayService : Service() {
         // Remove all existing views with slide-up animation for old ones
         val existingViews = (0 until container.childCount).map { container.getChildAt(it) }
 
-        // Animate existing lines sliding up slightly
-        existingViews.forEach { view ->
+        // Animate existing lines sliding up slightly, rebuild only after the last animation ends
+        existingViews.forEachIndexed { index, view ->
+            val isLast = index == existingViews.lastIndex
             view.animate()
                 .translationY(-dp(4).toFloat())
                 .alpha(if (subtitleLines.size >= MAX_LINES) 0f else 1f)
                 .setDuration(150)
-                .withEndAction {
-                    container.removeAllViews()
-                    addLineViews(container)
+                .apply {
+                    if (isLast) withEndAction {
+                        container.removeAllViews()
+                        addLineViews(container)
+                    }
                 }
                 .start()
         }
@@ -199,9 +202,12 @@ class OverlayService : Service() {
                     .start()
 
                 // Schedule this line to fade after LINE_LIFE_MS
+                // Capture the exact index to avoid removing a later duplicate by value
+                val scheduledText = text
                 mainHandler.postDelayed({
-                    if (subtitleLines.contains(text)) {
-                        subtitleLines.remove(text)
+                    val idx = subtitleLines.indexOf(scheduledText)
+                    if (idx >= 0) {
+                        subtitleLines.removeAt(idx)
                         if (running) mainHandler.post { rebuildLines(container) }
                     }
                 }, LINE_LIFE_MS)
