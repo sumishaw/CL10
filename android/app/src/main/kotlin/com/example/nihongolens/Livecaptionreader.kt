@@ -117,14 +117,21 @@ class LiveCaptionReader : AccessibilityService() {
     }
 
     private fun checkIfLiveCaptionsWindow(event: AccessibilityEvent, pkg: String) {
-        // Look for a window with caption-like view IDs
+        // Only check TYPE_WINDOWS_CHANGED events — Live Captions appears as a floating window
+        if (event.eventType != AccessibilityEvent.TYPE_WINDOWS_CHANGED &&
+            event.eventType != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) return
+
+        // Look for a window with known caption view IDs ONLY
         val root = try { rootInActiveWindow } catch (_: Exception) { null } ?: return
         val captionNode = findCaptionNode(root)
         if (captionNode != null) {
-            Log.i(TAG, "Live Captions detected in package: $pkg")
-            detectedPackage = pkg
             val text = captionNode.text?.toString()?.trim() ?: return
-            if (text.length > 1) scheduleTranslation(text)
+            // Additional check: text should look like speech (no special chars, reasonable length)
+            if (text.length in 3..200 && text.none { it.code < 32 }) {
+                Log.i(TAG, "Live Captions auto-detected in package: $pkg — node: ${captionNode.viewIdResourceName}")
+                detectedPackage = pkg
+                scheduleTranslation(text)
+            }
         }
     }
 
@@ -141,14 +148,18 @@ class LiveCaptionReader : AccessibilityService() {
     // ── Text extraction ───────────────────────────────────────────────────────
 
     private fun extractCaptionText(event: AccessibilityEvent): String? {
-        // Method 1: Direct from event text
-        val evText = event.text
-            ?.mapNotNull { it?.toString()?.trim() }
-            ?.filter { it.length > 1 }
-            ?.joinToString(" ")
-        if (!evText.isNullOrBlank()) return evText
+        // Method 1: Direct from event text — ONLY use when package is confirmed Live Captions
+        // Do NOT use event text from unknown packages (catches keyboard, password fields etc.)
+        val pkg = event.packageName?.toString() ?: ""
+        if (pkg in LIVE_CAPTION_PACKAGES) {
+            val evText = event.text
+                ?.mapNotNull { it?.toString()?.trim() }
+                ?.filter { it.length > 1 }
+                ?.joinToString(" ")
+            if (!evText.isNullOrBlank()) return evText
+        }
 
-        // Method 2: Walk accessibility tree for caption nodes
+        // Method 2: Walk accessibility tree — ONLY look for known caption view IDs
         val root = try { rootInActiveWindow } catch (_: Exception) { null } ?: return null
         return findCaptionNode(root)?.text?.toString()?.trim()
     }
@@ -157,19 +168,11 @@ class LiveCaptionReader : AccessibilityService() {
         node ?: return null
         val viewId = node.viewIdResourceName?.lowercase() ?: ""
         val text   = node.text?.toString()?.trim() ?: ""
-        val cls    = node.className?.toString()?.lowercase() ?: ""
 
-        // Match known caption view IDs
+        // ONLY match known Live Captions view IDs — never generic TextViews
+        // This prevents reading from keyboard, password fields, URLs, etc.
         if (CAPTION_VIEW_IDS.any { viewId.contains(it) } && text.isNotBlank()) {
             return node
-        }
-
-        // Match TextView with reasonable speech length (Live Captions style)
-        if (cls.contains("textview") && text.length in 3..300) {
-            // Additional heuristic: Live Captions text doesn't contain URLs or long words
-            if (!text.contains("http") && !text.contains("www.")) {
-                return node
-            }
         }
 
         for (i in 0 until node.childCount) {
@@ -206,6 +209,7 @@ class LiveCaptionReader : AccessibilityService() {
                 lastHindiOut = hindi
 
                 Log.d(TAG, "Hindi: $hindi")
+                Log.d(TAG, "Source pkg: $detectedPackage")
                 SpeechCaptureService.latestHindi   = hindi
                 SpeechCaptureService.latestEnglish = text
 
