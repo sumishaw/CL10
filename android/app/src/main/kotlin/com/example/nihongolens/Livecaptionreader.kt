@@ -10,38 +10,28 @@ import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.atomic.AtomicLong
 
 /**
- * LiveCaptionReader — continuously reads Live Captions overlay and
- * translates to Hindi via whisper_server.py CT2 pipeline.
- *
- * Two read paths run in parallel:
- *  1. onAccessibilityEvent — event-driven, fires on UI changes (fast)
- *  2. Watchdog poller      — active poll every 1.5s regardless of events (resilient)
- *
- * This guarantees translation never stops as long as Live Captions is visible,
- * even if Android throttles accessibility events during heavy CPU load.
+ * LiveCaptionReader — reads Live Captions, translates to Hindi.
+ * Full diagnostic logging via CaptionLogger → /sdcard/caption_lens_log.txt
  */
 class LiveCaptionReader : AccessibilityService() {
 
     companion object {
-        private const val TAG = "LiveCaptionReader"
+        private const val TAG          = "LCReader"
+        private const val TRANSLATE_URL   = "http://127.0.0.1:8765/translate_text"
+        private const val CONNECT_TIMEOUT = 2_000
+        private const val READ_TIMEOUT    = 12_000
+        private const val DEBOUNCE_MS     = 500L
+        private const val MAX_WAIT_MS     = 3_000L
+        private const val WATCHDOG_MS     = 1_500L
 
         private val LIVE_CAPTION_PACKAGES = setOf(
             "com.google.android.as",
             "com.google.android.as.oss",
             "com.google.android.tts",
         )
-
-        private const val TRANSLATE_URL   = "http://127.0.0.1:8765/translate_text"
-        private const val CONNECT_TIMEOUT = 2_000
-        private const val READ_TIMEOUT    = 12_000
-        private const val DEBOUNCE_MS     = 500L
-        private const val MAX_WAIT_MS     = 3_000L
-
-        // Watchdog polls Live Captions window directly at this interval.
-        // Catches updates missed when Android throttles accessibility events.
-        private const val WATCHDOG_MS     = 1_500L
 
         @Volatile var isRunning = false
         @Volatile var instance: LiveCaptionReader? = null
@@ -52,18 +42,24 @@ class LiveCaptionReader : AccessibilityService() {
     private var forceJob:        Job? = null
     private var translateJob:    Job? = null
     private var watchdogJob:     Job? = null
+
     private var lastSentText     = ""
     private var lastHindiOut     = ""
     private var lastDetectedLang = ""
-
-    // Unbounded FIFO — every sentence reaches the overlay, never dropped
-    private val translateQueue = LinkedBlockingQueue<String>()
+    private val translateQueue   = LinkedBlockingQueue<String>()
 
     // Window reader state
+    private var lastRawCaption    = ""
+    private var lastSentText2     = ""
+    private var captionWasVisible = false
+
+    // Counters for log diagnostics
+    private val eventsReceived   = AtomicLong(0)
+    private val windowReadNull   = AtomicLong(0)
+    private val enqueued         = AtomicLong(0)
+    private val translated       = AtomicLong(0)
+    private val translateErrors  = AtomicLong(0)
     private var lastTranslatedSentence = ""
-    private var lastRawCaption         = ""
-    private var lastSentText2          = ""
-    private var captionWasVisible      = false
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -84,21 +80,31 @@ class LiveCaptionReader : AccessibilityService() {
                 AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
                 AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
             )
-            info.packageNames = null  // receive events from ALL packages
+            info.packageNames = null
         }
 
         resetState()
         startTranslateWorker()
         startWatchdog()
-        Log.i(TAG, "LiveCaptionReader connected — event + watchdog active")
+        startStatsLogger()
+
+        CaptionLogger.log(TAG, "=== LiveCaptionReader CONNECTED ===")
+        CaptionLogger.log(TAG, "WATCHDOG=${WATCHDOG_MS}ms DEBOUNCE=${DEBOUNCE_MS}ms MAX_WAIT=${MAX_WAIT_MS}ms")
+
         scope.launch(Dispatchers.Main) {
             MainActivity.instance?.onLiveCaptionReaderConnected()
         }
     }
 
-    override fun onInterrupt() { Log.w(TAG, "Interrupted") }
+    override fun onInterrupt() {
+        CaptionLogger.log(TAG, "!!! onInterrupt called — accessibility service interrupted !!!")
+    }
 
     override fun onDestroy() {
+        CaptionLogger.log(TAG, "=== LiveCaptionReader DESTROYED ===")
+        CaptionLogger.log(TAG, "Final stats: events=${eventsReceived.get()} " +
+            "nullReads=${windowReadNull.get()} enqueued=${enqueued.get()} " +
+            "translated=${translated.get()} errors=${translateErrors.get()}")
         isRunning = false
         instance  = null
         pendingJob?.cancel()
@@ -109,46 +115,85 @@ class LiveCaptionReader : AccessibilityService() {
         super.onDestroy()
     }
 
-    // ── Event-driven read path ────────────────────────────────────────────────
+    // ── Event path ────────────────────────────────────────────────────────────
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (!isRunning || event == null) return
-        // No package filter — TYPE_WINDOWS_CHANGED fires with foreground app pkg
-        val sendText = readFromCaptionWindow() ?: return
-        Log.d(TAG, "Event→ ${sendText.take(60)}")
+        val n = eventsReceived.incrementAndGet()
+        // Log every 50th event to avoid flooding the file
+        if (n % 50 == 0L) CaptionLogger.log(TAG, "Events received: $n")
+
+        val sendText = readFromCaptionWindow() ?: run {
+            windowReadNull.incrementAndGet(); return
+        }
+        CaptionLogger.log(TAG, "EVENT text='${sendText.take(60)}'")
         scheduleTranslation(sendText)
     }
 
-    // ── Watchdog read path ────────────────────────────────────────────────────
+    // ── Watchdog path ─────────────────────────────────────────────────────────
 
-    /**
-     * Polls the Live Captions window every WATCHDOG_MS regardless of events.
-     * Recovers from Android event throttling, CPU spikes, or any gap where
-     * onAccessibilityEvent stops firing while Live Captions is still running.
-     */
     private fun startWatchdog() {
         watchdogJob = scope.launch {
-            Log.i(TAG, "Watchdog started — polling every ${WATCHDOG_MS}ms")
+            CaptionLogger.log(TAG, "Watchdog started ${WATCHDOG_MS}ms")
+            var watchdogTick = 0L
             while (isActive && isRunning) {
                 delay(WATCHDOG_MS)
+                watchdogTick++
+
                 val sendText = withContext(Dispatchers.Main) {
-                    try { readFromCaptionWindow() } catch (_: Exception) { null }
-                } ?: continue
-                // Only act if this text hasn't already been enqueued by the event path
-                if (sendText == lastSentText) continue
-                Log.d(TAG, "Watchdog→ ${sendText.take(60)}")
+                    try { readFromCaptionWindow() } catch (e: Exception) {
+                        CaptionLogger.log(TAG, "Watchdog readWindow EXCEPTION: ${e.message}")
+                        null
+                    }
+                }
+
+                if (sendText == null) {
+                    // Log every 10 watchdog ticks if nothing is being read
+                    if (watchdogTick % 10 == 0L) {
+                        CaptionLogger.log(TAG, "Watchdog tick=$watchdogTick: LC window not visible " +
+                            "captionVisible=$captionWasVisible rawLen=${lastRawCaption.length} " +
+                            "queueSize=${translateQueue.size}")
+                    }
+                    continue
+                }
+
+                if (sendText == lastSentText) {
+                    CaptionLogger.log(TAG, "Watchdog: skip duplicate '${sendText.take(40)}'")
+                    continue
+                }
+
+                CaptionLogger.log(TAG, "Watchdog tick=$watchdogTick NEW text='${sendText.take(60)}'")
                 scheduleTranslation(sendText)
             }
-            Log.i(TAG, "Watchdog stopped")
+            CaptionLogger.log(TAG, "Watchdog stopped")
+        }
+    }
+
+    // ── Stats logger ──────────────────────────────────────────────────────────
+
+    private fun startStatsLogger() {
+        scope.launch {
+            while (isActive && isRunning) {
+                delay(30_000L)  // every 30s
+                CaptionLogger.log(TAG, "STATS 30s: events=${eventsReceived.get()} " +
+                    "nullReads=${windowReadNull.get()} enqueued=${enqueued.get()} " +
+                    "translated=${translated.get()} errors=${translateErrors.get()} " +
+                    "queueSize=${translateQueue.size} " +
+                    "captionVisible=$captionWasVisible " +
+                    "lastLang=$lastDetectedLang " +
+                    "lastSent='${lastSentText.take(40)}'")
+            }
         }
     }
 
     // ── Window reader ─────────────────────────────────────────────────────────
 
     private fun readFromCaptionWindow(): String? {
-        val allWindows = try { windows } catch (_: Exception) { return null }
+        val allWindows = try { windows } catch (e: Exception) {
+            CaptionLogger.log(TAG, "windows EXCEPTION: ${e.message}")
+            return null
+        }
 
-        // Find the Live Captions window
         var captionRoot: AccessibilityNodeInfo? = null
         if (!allWindows.isNullOrEmpty()) {
             for (window in allWindows) {
@@ -160,18 +205,16 @@ class LiveCaptionReader : AccessibilityService() {
             }
         }
 
-        // Window not visible → silence → reset state
         if (captionRoot == null) {
             if (captionWasVisible) {
                 captionWasVisible = false
                 lastRawCaption    = ""
                 lastSentText2     = ""
-                Log.d(TAG, "LC gone — state reset")
+                CaptionLogger.log(TAG, "LC window GONE — state reset")
             }
             return null
         }
 
-        // Collect all text nodes
         val nodes = mutableListOf<String>()
         collectAllText(captionRoot, nodes)
         captionRoot.recycle()
@@ -180,31 +223,37 @@ class LiveCaptionReader : AccessibilityService() {
             .filter  { isValidCaption(it) }
             .filter  { !isStaticUiLabel(it) }
             .maxByOrNull { it.length }
-            ?.trim() ?: return null
+            ?.trim() ?: run {
+                if (captionWasVisible)
+                    CaptionLogger.log(TAG, "LC window visible but no valid text nodes (${nodes.size} raw nodes)")
+                return null
+            }
 
-        // Fresh session — LC window reappeared after silence
         if (!captionWasVisible) {
             captionWasVisible = true
             lastRawCaption    = ""
             lastSentText2     = ""
-            Log.d(TAG, "LC appeared — fresh session")
+            CaptionLogger.log(TAG, "LC window APPEARED — fresh session text='${fullText.take(60)}'")
         }
 
-        // No raw change since last read
         if (fullText == lastRawCaption) return null
 
-        // Extract only the new suffix appended since last read
         val prevFull   = lastSentText2
         lastRawCaption = fullText
 
         val newPart: String = if (prevFull.isNotEmpty() && fullText.startsWith(prevFull))
-            fullText.substring(prevFull.length).trim()   // pure append — exact new suffix
-        else
-            fullText.takeLast(150).trim()                // correction/reset — send tail for context
+            fullText.substring(prevFull.length).trim()
+        else {
+            CaptionLogger.log(TAG, "LC non-append: prevLen=${prevFull.length} newLen=${fullText.length}")
+            fullText.takeLast(150).trim()
+        }
 
         lastSentText2 = fullText
 
-        if (newPart.length < 3) return null
+        if (newPart.length < 3) {
+            CaptionLogger.log(TAG, "newPart too short (${newPart.length}): '${newPart}'")
+            return null
+        }
         return newPart
     }
 
@@ -213,34 +262,31 @@ class LiveCaptionReader : AccessibilityService() {
     private fun scheduleTranslation(sendText: String) {
         val scriptNow = detectScript(sendText)
         if (scriptNow != lastDetectedLang && lastDetectedLang.isNotEmpty()) {
-            // Language switched — clear all dedup state immediately so the
-            // first line of the new language is never blocked by old-language state.
-            // Do NOT touch captionWasVisible — the window is still visible,
-            // only the language changed.
-            Log.i(TAG, "Language switch: $lastDetectedLang → $scriptNow — resetting state")
+            CaptionLogger.log(TAG, "LANG SWITCH $lastDetectedLang→$scriptNow — clearing state+queue")
             lastSentText           = ""
             lastTranslatedSentence = ""
             lastHindiOut           = ""
             lastRawCaption         = ""
             lastSentText2          = ""
-            translateQueue.clear()  // discard old-language backlog
+            translateQueue.clear()
         }
         lastDetectedLang = scriptNow
 
-        // Debounce: 500ms wait lets LC finish word-correction on current line
         pendingJob?.cancel()
         pendingJob = scope.launch {
             delay(DEBOUNCE_MS)
-            enqueueForTranslation(lastSentText2.ifBlank { sendText })
+            val toSend = lastSentText2.ifBlank { sendText }
+            CaptionLogger.log(TAG, "Debounce fired — enqueue '${toSend.take(60)}'")
+            enqueueForTranslation(toSend)
         }
 
-        // Force-send: if speech is continuous and debounce keeps getting
-        // cancelled, guarantee a send every MAX_WAIT_MS anyway
         if (forceJob == null || forceJob?.isActive == false) {
             forceJob = scope.launch {
                 delay(MAX_WAIT_MS)
                 pendingJob?.cancel()
-                enqueueForTranslation(lastSentText2.ifBlank { sendText })
+                val toSend = lastSentText2.ifBlank { sendText }
+                CaptionLogger.log(TAG, "ForceJob fired — enqueue '${toSend.take(60)}'")
+                enqueueForTranslation(toSend)
             }
         }
     }
@@ -248,33 +294,63 @@ class LiveCaptionReader : AccessibilityService() {
     private fun enqueueForTranslation(text: String) {
         forceJob?.cancel()
         forceJob = null
-        if (text.isBlank() || text == lastSentText) return
+        if (text.isBlank()) {
+            CaptionLogger.log(TAG, "enqueue SKIP: blank"); return
+        }
+        if (text == lastSentText) {
+            CaptionLogger.log(TAG, "enqueue SKIP: duplicate '${text.take(40)}'"); return
+        }
         lastSentText = text
-        translateQueue.offer(text)   // FIFO — always add, never drop
+        translateQueue.offer(text)
+        enqueued.incrementAndGet()
+        CaptionLogger.log(TAG, "ENQUEUED #${enqueued.get()} qSize=${translateQueue.size} '${text.take(60)}'")
     }
 
     // ── Translation worker ────────────────────────────────────────────────────
 
     private fun startTranslateWorker() {
         translateJob = scope.launch {
+            CaptionLogger.log(TAG, "TranslateWorker started")
             while (isActive) {
                 val text = withContext(Dispatchers.IO) {
                     try { translateQueue.poll(2, java.util.concurrent.TimeUnit.SECONDS) }
                     catch (_: InterruptedException) { null }
-                } ?: continue
+                }
 
-                val hindi = translate(text) ?: continue
-                if (hindi.isBlank()) continue
+                if (text == null) {
+                    // Poll timeout — log every 5th idle to detect stalls
+                    if (translated.get() > 0 && enqueued.get() == translated.get())
+                        CaptionLogger.log(TAG, "Worker idle — queue empty, all translated")
+                    continue
+                }
 
-                Log.i(TAG, "✓ ${text.take(40)} → ${hindi.take(40)}")
+                CaptionLogger.log(TAG, "Worker dequeued '${text.take(60)}' — calling server")
+                val t0    = System.currentTimeMillis()
+                val hindi = translate(text)
+                val ms    = System.currentTimeMillis() - t0
+
+                if (hindi == null) {
+                    translateErrors.incrementAndGet()
+                    CaptionLogger.log(TAG, "translate() RETURNED NULL in ${ms}ms errors=${translateErrors.get()}")
+                    continue
+                }
+                if (hindi.isBlank()) {
+                    CaptionLogger.log(TAG, "translate() returned BLANK in ${ms}ms text='${text.take(60)}'")
+                    continue
+                }
+
+                translated.incrementAndGet()
+                CaptionLogger.log(TAG, "TRANSLATED #${translated.get()} in ${ms}ms " +
+                    "'${text.take(40)}' → '${hindi.take(40)}'")
+
                 SpeechCaptureService.latestHindi   = hindi
                 SpeechCaptureService.latestEnglish = text
-
                 withContext(Dispatchers.Main) {
                     OverlayService.updateText(text, hindi)
                     MainActivity.instance?.onTranslation(text, hindi, hindi)
                 }
             }
+            CaptionLogger.log(TAG, "TranslateWorker STOPPED")
         }
     }
 
@@ -289,11 +365,15 @@ class LiveCaptionReader : AccessibilityService() {
             conn.readTimeout    = READ_TIMEOUT
             val body = """{"text":${JSONObject.quote(text)},"src":"auto","tgt":"hi"}"""
             conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
-            if (conn.responseCode != 200) return null
+            val code = conn.responseCode
+            if (code != 200) {
+                CaptionLogger.log(TAG, "HTTP $code from server for '${text.take(40)}'")
+                return null
+            }
             val resp = conn.inputStream.bufferedReader(Charsets.UTF_8).readText()
             JSONObject(resp).optString("text", "").trim().takeIf { it.isNotBlank() }
         } catch (e: Exception) {
-            Log.w(TAG, "Translate error: ${e.message}")
+            CaptionLogger.log(TAG, "translate() EXCEPTION: ${e.javaClass.simpleName}: ${e.message}")
             null
         } finally {
             try { conn?.disconnect() } catch (_: Exception) {}
@@ -350,9 +430,7 @@ class LiveCaptionReader : AccessibilityService() {
             if (cp in 0x0400..0x04FF) return "ru"
             if (cp in 0x0900..0x097F) return "hi"
         }
-        // Distinguish Latin-EN from Latin-other using diacritics (é ñ ü ö ç à etc.)
-        // A single accented letter is a strong signal of non-English Latin
-        val hasAccent = text.any { it.isLetter() && !it.isLetter().and(it.code < 128) && it.code in 0x00C0..0x024F }
+        val hasAccent = text.any { it.isLetter() && it.code in 0x00C0..0x024F }
         return if (hasAccent) "latin_foreign" else "latin_en"
     }
 }
