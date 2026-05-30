@@ -167,6 +167,9 @@ class MainActivity : FlutterActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Start file logger — writes to /sdcard/caption_lens_log.txt
+        CaptionLogger.init(this)
+        CaptionLogger.log("MainActivity", "App started — log: ${CaptionLogger.getLogPath()}")
         checkAndNotifyWhisperReady()
     }
 
