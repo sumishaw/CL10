@@ -30,7 +30,7 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
+class _HomePageState extends State<HomePage> with WidgetsBindingObserver, SingleTickerProviderStateMixin {
   static const _ch = MethodChannel('overlay_channel');
 
   // State
@@ -50,12 +50,18 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   ModelState  modelState    = ModelState.checking;
   String      modelErrorMsg = '';
 
-  // Live Captions mode is now the primary mode
   CaptionMode captionMode = CaptionMode.liveCaptions;
+
+  // Log tab state
+  late TabController _tabController;
+  String  _logText      = 'Tap Refresh to load logs.';
+  bool    _logLoading   = false;
+  final   ScrollController _logScroll = ScrollController();
 
   @override
   void initState() {
     super.initState();
+    _tabController = TabController(length: 2, vsync: this);
     WidgetsBinding.instance.addObserver(this);
 
     _ch.setMethodCallHandler((call) async {
@@ -214,6 +220,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   @override
   void dispose() {
+    _tabController.dispose();
+    _logScroll.dispose();
     _pulseTimer?.cancel();
     _pollTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
@@ -226,12 +234,38 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.black,
-      body: SafeArea(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.all(20),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
+      appBar: AppBar(
+        backgroundColor: Colors.black,
+        elevation: 0,
+        toolbarHeight: 0,
+        bottom: TabBar(
+          controller: _tabController,
+          indicatorColor: const Color(0xFFFF3B3B),
+          labelColor: Colors.white,
+          unselectedLabelColor: Colors.white38,
+          tabs: const [
+            Tab(icon: Icon(Icons.subtitles), text: 'Caption Lens'),
+            Tab(icon: Icon(Icons.article_outlined), text: 'Logs'),
+          ],
+        ),
+      ),
+      body: TabBarView(
+        controller: _tabController,
+        children: [
+          _buildMainTab(),
+          _buildLogTab(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildMainTab() {
+    return SafeArea(
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
               _buildHeader(),
               const SizedBox(height: 16),
               _buildInfoBanner(),
@@ -274,6 +308,100 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             ],
           ),
         ),
+      ),
+    );
+  }
+
+  // ── Log tab ───────────────────────────────────────────────────────────────
+
+  Future<void> _refreshLogs() async {
+    if (_logLoading) return;
+    setState(() => _logLoading = true);
+    try {
+      final logs = await _ch.invokeMethod<String>('getLogs') ?? 'No logs yet.';
+      setState(() => _logText = logs.isEmpty ? 'No logs yet.' : logs);
+      // Scroll to bottom after render
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (_logScroll.hasClients)
+          _logScroll.jumpTo(_logScroll.position.maxScrollExtent);
+      });
+    } catch (e) {
+      setState(() => _logText = 'Error fetching logs: $e');
+    } finally {
+      setState(() => _logLoading = false);
+    }
+  }
+
+  Future<void> _clearLogs() async {
+    await _ch.invokeMethod('clearLogs');
+    setState(() => _logText = 'Logs cleared.');
+  }
+
+  Widget _buildLogTab() {
+    return SafeArea(
+      child: Column(
+        children: [
+          // Toolbar
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            child: Row(
+              children: [
+                const Text('Diagnostic Logs',
+                    style: TextStyle(color: Colors.white, fontSize: 15,
+                        fontWeight: FontWeight.bold)),
+                const Spacer(),
+                if (_logLoading)
+                  const SizedBox(width: 20, height: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2,
+                          color: Color(0xFFFF3B3B)))
+                else
+                  IconButton(
+                    icon: const Icon(Icons.refresh, color: Color(0xFFFF3B3B)),
+                    tooltip: 'Refresh',
+                    onPressed: _refreshLogs,
+                  ),
+                IconButton(
+                  icon: const Icon(Icons.delete_outline, color: Colors.white38),
+                  tooltip: 'Clear',
+                  onPressed: _clearLogs,
+                ),
+              ],
+            ),
+          ),
+          const Divider(color: Colors.white12, height: 1),
+          // Log content
+          Expanded(
+            child: _logText.isEmpty
+                ? const Center(child: Text('No logs yet — tap Refresh',
+                    style: TextStyle(color: Colors.white38)))
+                : Scrollbar(
+                    controller: _logScroll,
+                    thumbVisibility: true,
+                    child: SingleChildScrollView(
+                      controller: _logScroll,
+                      padding: const EdgeInsets.all(12),
+                      child: SelectableText(
+                        _logText,
+                        style: const TextStyle(
+                          color: Colors.white70,
+                          fontSize: 11,
+                          fontFamily: 'monospace',
+                          height: 1.5,
+                        ),
+                      ),
+                    ),
+                  ),
+          ),
+          // Bottom hint
+          Padding(
+            padding: const EdgeInsets.all(8),
+            child: Text(
+              'Long-press text to copy • Tap Refresh to update',
+              style: const TextStyle(color: Colors.white24, fontSize: 10),
+              textAlign: TextAlign.center,
+            ),
+          ),
+        ],
       ),
     );
   }
