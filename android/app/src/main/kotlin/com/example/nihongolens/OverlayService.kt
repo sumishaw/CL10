@@ -13,15 +13,14 @@ import android.widget.*
 import androidx.core.app.NotificationCompat
 
 /**
- * OverlayService — 2-line Hindi subtitle overlay
+ * OverlayService — Hindi subtitle overlay
  *
- * Display model:
- *  - Each translation result = one display unit (never split into fragments)
- *  - Unit shown across up to 2 wrapped lines of text
- *  - Unit stays visible for READ_MS (3s) minimum so user can read it
- *  - Next unit from FIFO queue shown after READ_MS
- *  - If queue empty after READ_MS, current unit stays until SILENCE_MS (8s) then fades
- *  - FIFO queue — never drops any translation
+ * - Single TextView, maxLines=2, wraps naturally
+ * - FIFO queue: every translation shown in order, nothing dropped
+ * - READ_MS: each subtitle stays 7s before advancing
+ * - Backlog mode: if 3+ queued, advance every 3.5s to catch up
+ * - SILENCE_MS: fade out after 10s with no new text
+ * - One timer only: readRunnable always cancelled before creating new one
  */
 class OverlayService : Service() {
 
@@ -40,58 +39,53 @@ class OverlayService : Service() {
         }
     }
 
-    // Maximum time each translation unit stays visible before advancing to next
-    private val READ_MS      = 7_000L
-    // After last speech, fade overlay after this silence
-    private val SILENCE_MS   = 10_000L
+    private val READ_MS    = 7_000L
+    private val SILENCE_MS = 10_000L
 
-    // FIFO queue of translation units (each = full Hindi result, not split)
-    private val displayQueue  = ArrayDeque<String>()
+    // FIFO — never drops
+    private val queue       = ArrayDeque<String>()
+    private var currentText = ""
+    private var showing     = false
 
-    private var windowManager:  WindowManager?              = null
-    private var overlayView:    View?                       = null
-    private var textView:       TextView?                   = null
-    private var params:         WindowManager.LayoutParams? = null
-    private val mainHandler     = Handler(Looper.getMainLooper())
+    private var readRunnable:    Runnable? = null
+    private var silenceRunnable: Runnable? = null
+
+    private var windowManager: WindowManager?              = null
+    private var textView:      TextView?                   = null
+    private var overlayView:   View?                       = null
+    private var params:        WindowManager.LayoutParams? = null
+    private val handler        = Handler(Looper.getMainLooper())
 
     @Volatile private var running   = true
     @Volatile private var viewAdded = false
 
-    private var currentText      = ""
-    private var readRunnable:    Runnable? = null
-    private var silenceRunnable: Runnable? = null
-    private var isShowing        = false
-
     private fun dp(v: Int) = TypedValue.applyDimension(
-        TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), resources.displayMetrics
-    ).toInt()
+        TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), resources.displayMetrics).toInt()
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
             startForeground(NOTIF_ID, buildNotification(),
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-        } else {
+        else
             startForeground(NOTIF_ID, buildNotification())
-        }
+
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
-        mainHandler.post { if (running) buildOverlay() }
-        pushCallback = { _, hindi -> mainHandler.post { onNewText(hindi) } }
+        handler.post { if (running) buildOverlay() }
+        pushCallback = { _, hindi -> handler.post { onNewHindi(hindi) } }
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int) = START_STICKY
-    override fun onBind(intent: Intent?): IBinder? = null
+    override fun onStartCommand(i: Intent?, f: Int, s: Int) = START_STICKY
+    override fun onBind(i: Intent?): IBinder? = null
 
     override fun onDestroy() {
-        running      = false
+        running = false
         pushCallback = null
-        mainHandler.removeCallbacksAndMessages(null)
-        displayQueue.clear()
-        currentText = ""
-        isShowing   = false
+        handler.removeCallbacksAndMessages(null)
+        queue.clear()
         if (viewAdded) {
             try { windowManager?.removeView(overlayView) } catch (_: Exception) {}
             viewAdded = false
@@ -99,99 +93,75 @@ class OverlayService : Service() {
         super.onDestroy()
     }
 
-    // ── Text update ───────────────────────────────────────────────────────────
+    // ── Core display logic ────────────────────────────────────────────────────
 
-    private fun onNewText(hindi: String) {
+    private fun onNewHindi(hindi: String) {
         if (hindi.isBlank()) return
+        val t = hindi.trim()
 
-        val trimmed = hindi.trim()
-        // Don't add exact duplicate of what's currently showing if queue is empty
-        if (trimmed == currentText && displayQueue.isEmpty()) {
+        // Skip exact duplicate of what's on screen if nothing else waiting
+        if (t == currentText && queue.isEmpty()) {
             rescheduleSilence(); return
         }
 
-        // Add to FIFO queue — never drop
-        displayQueue.addLast(trimmed)
-
-        // Only kick display if not already showing — prevents multiple timers stacking
-        if (!isShowing) showNext()
-
+        queue.addLast(t)          // FIFO add
         rescheduleSilence()
+
+        // Kick display only if idle — if already showing, readRunnable will advance
+        if (!showing) advance()
     }
 
-    // Show the next item from the queue
-    private fun showNext() {
-        // Cancel any pending read timer first — only one timer at a time
-        readRunnable?.let { mainHandler.removeCallbacks(it) }
+    /**
+     * Advance to the next queued item.
+     * Always cancels existing readRunnable before doing anything.
+     * This is the ONLY place readRunnable is created.
+     */
+    private fun advance() {
+        // Cancel any existing timer — one timer at a time
+        readRunnable?.let { handler.removeCallbacks(it) }
         readRunnable = null
 
-        if (displayQueue.isEmpty()) {
-            // Nothing more — stay on current text until silence timer fires
+        if (queue.isEmpty()) {
+            // Nothing to show — stay on current text until silence
             return
         }
 
-        val text = displayQueue.removeFirst()
+        val text   = queue.removeFirst()   // FIFO remove
         currentText = text
-        isShowing   = true
-        showText(text, animate = true)
+        showing     = true
+        display(text)
 
-        // Schedule advance to next after READ_MS
-        // If backlog building (3+ waiting), use half time to catch up
-        val waitMs = if (displayQueue.size >= 3) READ_MS / 2 else READ_MS
+        // Schedule next advance
+        val waitMs = if (queue.size >= 3) READ_MS / 2 else READ_MS
         readRunnable = Runnable {
             readRunnable = null
             if (!running) return@Runnable
-            if (displayQueue.isNotEmpty()) {
-                showNext()
-            }
-            // else: stay on current text, silence timer will clear eventually
+            if (queue.isNotEmpty()) advance()
+            // else: stay on screen until silence or new text
         }
-        mainHandler.postDelayed(readRunnable!!, waitMs)
+        handler.postDelayed(readRunnable!!, waitMs)
     }
 
-    // ── Render ────────────────────────────────────────────────────────────────
-
-    private fun showText(text: String, animate: Boolean) {
+    private fun display(text: String) {
         val tv = textView ?: return
-        if (animate) {
-            tv.animate().cancel()
-            tv.alpha = 0f
-            tv.text  = text
-            tv.animate()
-                .alpha(1f)
-                .setDuration(200)
-                .start()
-        } else {
-            tv.text  = text
-            tv.alpha = 1f
-        }
-    }
-
-    private fun fadeOut(then: (() -> Unit)? = null) {
-        val tv = textView ?: run { then?.invoke(); return }
-        tv.animate()
-            .alpha(0f)
-            .setDuration(300)
-            .withEndAction {
-                currentText = ""
-                isShowing   = false
-                then?.invoke()
-            }
-            .start()
+        tv.animate().cancel()
+        tv.alpha = 0f
+        tv.text  = text
+        tv.animate().alpha(1f).setDuration(180).start()
     }
 
     private fun rescheduleSilence() {
-        silenceRunnable?.let { mainHandler.removeCallbacks(it) }
+        silenceRunnable?.let { handler.removeCallbacks(it) }
         silenceRunnable = Runnable {
             if (!running) return@Runnable
-            // Only clear if no new content arrived while we were waiting
-            if (displayQueue.isEmpty()) {
-                readRunnable?.let { mainHandler.removeCallbacks(it) }
-                readRunnable = null
-                fadeOut()
-            }
+            if (queue.isNotEmpty()) return@Runnable  // new content arrived — don't clear
+            readRunnable?.let { handler.removeCallbacks(it) }
+            readRunnable = null
+            textView?.animate()?.alpha(0f)?.setDuration(400)?.withEndAction {
+                currentText = ""; showing = false
+            }?.start()
         }
-        mainHandler.postDelayed(silenceRunnable!!, SILENCE_MS)
+        handler.postDelayed(silenceRunnable!!, SILENCE_MS)
     }
 
     // ── Overlay window ────────────────────────────────────────────────────────
@@ -199,9 +169,6 @@ class OverlayService : Service() {
     private fun buildOverlay() {
         try {
             val sw = resources.displayMetrics.widthPixels
-
-            // Single TextView — 2 lines max, wraps naturally
-            // No splitting, no containers, no complex logic
             val tv = TextView(this).apply {
                 typeface  = Typeface.DEFAULT_BOLD
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
@@ -212,9 +179,9 @@ class OverlayService : Service() {
                 background = android.graphics.drawable.GradientDrawable().apply {
                     shape        = android.graphics.drawable.GradientDrawable.RECTANGLE
                     cornerRadius = dp(10).toFloat()
-                    setColor(Color.argb(180, 0, 0, 0))
+                    setColor(Color.argb(185, 0, 0, 0))
                 }
-                setPadding(dp(14), dp(8), dp(14), dp(8))
+                setPadding(dp(14), dp(10), dp(14), dp(10))
                 alpha = 0f
                 text  = ""
             }
@@ -237,21 +204,16 @@ class OverlayService : Service() {
             }
 
             // Draggable
-            var startRawX = 0f; var startRawY = 0f
-            var initX = 0;      var initY = 0
+            var sx = 0f; var sy = 0f; var ix = 0; var iy = 0
             tv.setOnTouchListener { _, ev ->
                 val p = params ?: return@setOnTouchListener false
                 when (ev.action) {
-                    MotionEvent.ACTION_DOWN -> {
-                        startRawX = ev.rawX; startRawY = ev.rawY
-                        initX = p.x;         initY = p.y
-                    }
+                    MotionEvent.ACTION_DOWN -> { sx = ev.rawX; sy = ev.rawY; ix = p.x; iy = p.y }
                     MotionEvent.ACTION_MOVE -> {
-                        p.x = initX + (ev.rawX - startRawX).toInt()
-                        p.y = initY - (ev.rawY - startRawY).toInt()
-                        if (viewAdded) try {
-                            windowManager?.updateViewLayout(overlayView, p)
-                        } catch (_: Exception) {}
+                        p.x = ix + (ev.rawX - sx).toInt()
+                        p.y = iy - (ev.rawY - sy).toInt()
+                        if (viewAdded) try { windowManager?.updateViewLayout(overlayView, p) }
+                        catch (_: Exception) {}
                     }
                 }
                 true
@@ -259,20 +221,18 @@ class OverlayService : Service() {
 
             windowManager?.addView(overlayView, params)
             viewAdded = true
-
         } catch (e: Exception) {
-            android.util.Log.e("OverlayService", "buildOverlay error: ${e.message}")
+            android.util.Log.e("OverlayService", "buildOverlay: ${e.message}")
         }
     }
 
     private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
             NotificationChannel(CHANNEL_ID, "Caption Lens Overlay",
                 NotificationManager.IMPORTANCE_LOW)
                 .apply { setShowBadge(false) }
                 .also { getSystemService(NotificationManager::class.java)
                     .createNotificationChannel(it) }
-        }
     }
 
     private fun buildNotification(): Notification =
