@@ -32,8 +32,8 @@ class LiveCaptionReader : AccessibilityService() {
         private const val TRANSLATE_URL    = "http://127.0.0.1:8765/translate_text"
         private const val CONNECT_TIMEOUT  = 3_000
         private const val READ_TIMEOUT     = 30_000
-        private const val DEBOUNCE_MS      = 500L
-        private const val MAX_WAIT_MS      = 3_000L
+        private const val DEBOUNCE_MS      = 300L    // reduced: faster response
+        private const val MAX_WAIT_MS      = 2_000L  // reduced: don't wait too long
         private const val WATCHDOG_MS      = 1_500L
         private const val STARTUP_GRACE_MS = 1_000L
         // Lang switch only triggers after this many consecutive reads of same script
