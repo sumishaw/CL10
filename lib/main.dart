@@ -40,7 +40,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   bool    hasOverlay       = false;
   bool    hasAccessibility = false;
   String  targetLang       = 'hindi';
-  double  subtitleSpeed    = 3.5;   // seconds — default hold time
+  double  subtitleSpeed    = 6.0;   // Average — matches preset
   String  statusMsg        = '';
   int     translationCount = 0;
   bool    _pulse           = false;
@@ -565,44 +565,71 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     ],
   );
 
-  Widget _buildSubtitleSpeedSlider() => Column(
-    crossAxisAlignment: CrossAxisAlignment.start,
-    children: [
-      const SizedBox(height: 16),
-      Row(children: [
+  Widget _buildSubtitleSpeedSlider() {
+    final presets = [
+      {'label': 'Fastest', 'seconds': 2.0},
+      {'label': 'Fast',    'seconds': 4.0},
+      {'label': 'Average', 'seconds': 6.0},
+      {'label': 'Slow',    'seconds': 8.0},
+      {'label': 'Slowest', 'seconds': 10.0},
+    ];
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const SizedBox(height: 16),
         const Text('Subtitle display time',
             style: TextStyle(color: Colors.white54, fontSize: 12,
                 fontWeight: FontWeight.bold)),
-        const Spacer(),
-        Text('${subtitleSpeed.toStringAsFixed(1)}s',
-            style: const TextStyle(color: Color(0xFFFF3B3B),
-                fontSize: 13, fontWeight: FontWeight.bold)),
-      ]),
-      SliderTheme(
-        data: SliderTheme.of(context).copyWith(
-          activeTrackColor:   const Color(0xFFFF3B3B),
-          inactiveTrackColor: Colors.white12,
-          thumbColor:         const Color(0xFFFF3B3B),
-          overlayColor:       const Color(0x22FF3B3B),
-          trackHeight:        3,
+        const SizedBox(height: 10),
+        Row(
+          children: presets.map((p) {
+            final secs    = p['seconds'] as double;
+            final label   = p['label']   as String;
+            final selected = subtitleSpeed == secs;
+            return Expanded(
+              child: GestureDetector(
+                onTap: () => _setSubtitleSpeed(secs),
+                child: Container(
+                  margin: const EdgeInsets.symmetric(horizontal: 3),
+                  padding: const EdgeInsets.symmetric(vertical: 8),
+                  decoration: BoxDecoration(
+                    color: selected
+                        ? const Color(0xFFFF3B3B)
+                        : Colors.white10,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(
+                      color: selected
+                          ? const Color(0xFFFF3B3B)
+                          : Colors.white12,
+                      width: 1,
+                    ),
+                  ),
+                  child: Column(
+                    children: [
+                      Text(label,
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: selected ? Colors.white : Colors.white54,
+                            fontSize: 11,
+                            fontWeight: FontWeight.bold,
+                          )),
+                      const SizedBox(height: 2),
+                      Text('${secs.toInt()}s',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: selected ? Colors.white70 : Colors.white24,
+                            fontSize: 10,
+                          )),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          }).toList(),
         ),
-        child: Slider(
-          value:    subtitleSpeed,
-          min:      1.5,
-          max:      10.0,
-          divisions: 17,   // 0.5s steps: 1.5, 2.0, 2.5 ... 10.0
-          onChanged: (v) => _setSubtitleSpeed(double.parse(v.toStringAsFixed(1))),
-        ),
-      ),
-      Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: const [
-          Text('Fast', style: TextStyle(color: Colors.white24, fontSize: 10)),
-          Text('Slow', style: TextStyle(color: Colors.white24, fontSize: 10)),
-        ],
-      ),
-    ],
-  );
+      ],
+    );
+  }
 
   Widget _buildDetectedText() => Column(
     crossAxisAlignment: CrossAxisAlignment.start,
