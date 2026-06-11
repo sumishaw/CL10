@@ -153,7 +153,6 @@ class MainActivity : FlutterActivity() {
 
                 "setSubtitleSpeed" -> {
                     val seconds = (call.argument<Double>("seconds") ?: 6.0)
-                    // 0 = Live mode (instant display, no hold)
                     OverlayService.setHoldMs((seconds * 1000).toLong())
                     result.success(true)
                 }
