@@ -52,6 +52,7 @@ object HindiTtsService {
     private var ctx: Context?       = null
     private val mainHandler         = Handler(Looper.getMainLooper())
     private val scope               = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var cachedHindiVoices   = listOf<android.speech.tts.Voice>()
 
     // Dedup
     private var lastSpokenNorm = ""
@@ -98,7 +99,18 @@ object HindiTtsService {
                     }
                 })
                 ttsReady = true
-                Log.d(TAG, "TTS ready — voices: ${tts?.voices?.filter { it.locale.language == "hi" }?.map { it.name }}")
+
+                // Select specific Hindi voices:
+                // Voice I   = mature female, Voice II  = young female
+                // Voice III = mature male,   Voice IV  = young male
+                // We use Voice II (young female) and Voice IV (young male)
+                val allVoices = tts?.voices ?: emptySet()
+                val hindiVoices = allVoices
+                    .filter { it.locale.language == "hi" && !it.isNetworkConnectionRequired }
+                    .sortedBy { it.name }
+                Log.d(TAG, "Hindi voices available: ${hindiVoices.map { it.name }}")
+                // Cache all hindi voices for dynamic switching in speak()
+                cachedHindiVoices = hindiVoices
             } else {
                 Log.e(TAG, "TTS init failed: $status")
             }
@@ -123,16 +135,35 @@ object HindiTtsService {
         val gender = if (selectedGender == Gender.AUTO) detectedGender else selectedGender
         val pitch  = if (gender == Gender.FEMALE) 0.80f else 1.00f
 
+        // Select specific voice by name:
+        // Voice I   = mature female  (index 0)
+        // Voice II  = young female   (index 1) ← use for FEMALE
+        // Voice III = mature male    (index 2)
+        // Voice IV  = young male     (index 3) ← use for MALE
+        if (cachedHindiVoices.isNotEmpty()) {
+            val targetName = when (gender) {
+                Gender.FEMALE -> "Voice II"    // young female
+                else          -> "Voice IV"    // young male
+            }
+            val voice = cachedHindiVoices.firstOrNull { it.name.contains(targetName) }
+                ?: cachedHindiVoices.firstOrNull { it.name.contains(
+                    if (gender == Gender.FEMALE) "Voice I" else "Voice III") }
+                ?: cachedHindiVoices.first()
+            engine.voice = voice
+            Log.d(TAG, "Voice: ${voice.name} gender=$gender")
+        } else {
+            engine.setPitch(pitch)
+        }
+
         engine.setSpeechRate(speed)
         engine.setPitch(pitch)
 
         val id = "utt_${uttId++}"
         val params = Bundle().apply {
             putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, id)
-            // USAGE_ASSISTANT: excluded from Live Captions internal audio capture
-            // Live Captions only captures USAGE_MEDIA and USAGE_GAME streams
-            putInt(TextToSpeech.Engine.KEY_PARAM_STREAM,
-                android.media.AudioManager.STREAM_NOTIFICATION)
+            // STREAM_NOTIFICATION = 5 — excluded from Live Captions audio capture
+            // Live Captions only captures STREAM_MUSIC (3) and STREAM_GAME
+            putString(TextToSpeech.Engine.KEY_PARAM_STREAM, "5")
         }
 
         // Mark as speaking BEFORE queuing — ensures isSuppressed() is true
