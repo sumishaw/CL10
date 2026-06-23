@@ -80,9 +80,22 @@ object HindiTtsService {
                     tts?.setLanguage(Locale.ENGLISH)
                 }
                 tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                    override fun onStart(id: String?)  { isSpeaking = true  }
-                    override fun onDone(id: String?)   { isSpeaking = false }
-                    override fun onError(id: String?)  { isSpeaking = false }
+                    override fun onStart(id: String?)  {
+                        isSpeaking = true
+                    }
+                    override fun onDone(id: String?)   {
+                        // Check if more utterances queued — if not, set grace period
+                        // Grace period prevents mic from picking up echo of last words
+                        if (tts?.isSpeaking == false) {
+                            isSpeaking = false
+                            speakingUntilMs = System.currentTimeMillis() + 2_000L
+                        }
+                        // If more queued, isSpeaking stays true until all done
+                    }
+                    override fun onError(id: String?)  {
+                        isSpeaking = false
+                        speakingUntilMs = System.currentTimeMillis() + 1_000L
+                    }
                 })
                 ttsReady = true
                 Log.d(TAG, "TTS ready — voices: ${tts?.voices?.filter { it.locale.language == "hi" }?.map { it.name }}")
@@ -91,6 +104,10 @@ object HindiTtsService {
             }
         }
     }
+
+    @Volatile private var speakingUntilMs = 0L   // grace period after TTS ends
+
+    fun isSuppressed() = isSpeaking || System.currentTimeMillis() < speakingUntilMs
 
     // ── Speak ─────────────────────────────────────────────────────────────────
 
@@ -102,19 +119,9 @@ object HindiTtsService {
 
         val engine = tts ?: return
         val emotion = detectEmotion(hindi)
-
-        // Speed: user multiplier × emotion modifier
         val speed = (emotionSpeed(emotion) * ttsSpeedMultiplier).coerceIn(0.5f, 4.0f)
-
-        // Pitch: gender-based
-        // Female voice: pitch < 1.0 gives softer, more feminine quality on male TTS engine
-        // Male voice: pitch = 1.0 natural
         val gender = if (selectedGender == Gender.AUTO) detectedGender else selectedGender
-        val pitch  = when (gender) {
-            Gender.FEMALE -> 0.80f
-            Gender.MALE   -> 1.00f
-            Gender.AUTO   -> if (detectedGender == Gender.FEMALE) 0.80f else 1.00f
-        }
+        val pitch  = if (gender == Gender.FEMALE) 0.80f else 1.00f
 
         engine.setSpeechRate(speed)
         engine.setPitch(pitch)
@@ -122,10 +129,16 @@ object HindiTtsService {
         val id = "utt_${uttId++}"
         val params = Bundle().apply {
             putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, id)
+            // USAGE_ASSISTANT: excluded from Live Captions internal audio capture
+            // Live Captions only captures USAGE_MEDIA and USAGE_GAME streams
+            putInt(TextToSpeech.Engine.KEY_PARAM_STREAM,
+                android.media.AudioManager.STREAM_NOTIFICATION)
         }
 
-        // QUEUE_FLUSH: replace any pending utterance — stay near real-time
-        // If you want every sentence spoken: use QUEUE_ADD instead
+        // Mark as speaking BEFORE queuing — ensures isSuppressed() is true
+        // immediately so LiveCaptionReader blocks before TTS even starts
+        isSpeaking = true
+
         engine.speak(hindi, TextToSpeech.QUEUE_ADD, params, id)
         Log.d(TAG, "TTS speak speed=$speed pitch=$pitch gender=$gender '${hindi.take(30)}'")
     }
@@ -195,17 +208,17 @@ object HindiTtsService {
             val imag = FloatArray(N)
 
             while (isActive) {
-                // Pause during TTS — avoid detecting own voice
-                if (isSpeaking) { delay(200); continue }
+                // Pause during TTS AND grace period — avoid detecting own voice
+                if (isSuppressed()) { delay(200); continue }
 
                 val read = rec.read(buf, 0, N)
                 if (read < N) { delay(50); continue }
 
-                // RMS check — skip silence
+                // RMS check — skip silence (lower threshold for indirect speaker→mic pickup)
                 var sum = 0.0
                 for (i in 0 until N) sum += buf[i].toLong() * buf[i]
                 val rms = sqrt(sum / N)
-                if (rms < 80) { delay(30); continue }
+                if (rms < 50) { delay(30); continue }
 
                 // Apply Hann window + copy to real array
                 for (i in 0 until N) {
@@ -230,8 +243,8 @@ object HindiTtsService {
 
                 val f0 = peakBin.toFloat() * SR / N
 
-                // Require minimum signal strength to avoid noise
-                if (peakMag < 0.002f) { delay(50); continue }
+                // Require minimum signal strength (low threshold for speaker→mic)
+                if (peakMag < 0.0005f) { delay(50); continue }
 
                 val g = if (f0 >= 165f) Gender.FEMALE else Gender.MALE
 
