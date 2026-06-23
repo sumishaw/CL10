@@ -1,6 +1,9 @@
 package com.example.nihongolens
 
 import android.content.Context
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -10,6 +13,7 @@ import android.util.Log
 import kotlinx.coroutines.*
 import java.util.Locale
 import java.util.concurrent.LinkedBlockingQueue
+import kotlin.math.*
 
 /**
  * HindiTtsService — Zero-latency Hindi TTS using Android built-in engine.
@@ -198,14 +202,137 @@ object HindiTtsService {
         scope.cancel()
     }
 
-    // ── Gender detection via FFT on mic audio ─────────────────────────────────
-    // Tablet mic picks up audio from tablet speakers.
-    // FFT reveals fundamental frequency of the speaker's voice.
-    // Gender detection via GenderAnalyzer — uses internal audio (MediaProjection), not mic.
-    // GenderAnalyzer.feed() is called by SpeechCaptureService with raw PCM from the video.
-    // HindiTtsService.detectedGender is updated directly by GenderAnalyzer when AUTO mode.
+    // ── Gender detection via mic FFT (HPS method) ────────────────────────────
+    // Mic picks up speaker audio from tablet speakers.
+    // Harmonic Product Spectrum finds F0 accurately even when harmonics dominate.
+    // Male F0: 85-165 Hz | Female F0: 165-350 Hz
+
     private fun startGenderDetector() {
-        Log.d(TAG, "Gender detection: passive — GenderAnalyzer receives PCM from SpeechCaptureService")
+        if (genderJob?.isActive == true) return
+        genderJob = scope.launch {
+            val SR  = 16_000
+            val N   = 4096    // larger window = better frequency resolution
+            val MIN_BUF = AudioRecord.getMinBufferSize(
+                SR, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+
+            var rec: AudioRecord? = null
+            for (src in intArrayOf(
+                MediaRecorder.AudioSource.MIC,
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                MediaRecorder.AudioSource.DEFAULT)) {
+                try {
+                    val r = AudioRecord(src, SR, AudioFormat.CHANNEL_IN_MONO,
+                        AudioFormat.ENCODING_PCM_16BIT, maxOf(MIN_BUF, N * 2))
+                    if (r.state == AudioRecord.STATE_INITIALIZED) { rec = r; break }
+                    r.release()
+                } catch (_: Exception) {}
+            }
+            if (rec == null) { Log.e(TAG, "Gender: AudioRecord failed"); return@launch }
+            Log.d(TAG, "Gender detector started (HPS FFT, SR=$SR N=$N)")
+            rec.startRecording()
+
+            val buf  = ShortArray(N)
+            val re   = FloatArray(N)
+            val im   = FloatArray(N)
+
+            while (isActive) {
+                if (isSuppressed()) { delay(300); continue }  // skip during TTS + grace
+
+                val read = rec.read(buf, 0, N)
+                if (read < N) { delay(50); continue }
+
+                // RMS energy check
+                var energy = 0.0
+                for (i in 0 until N) energy += buf[i].toLong() * buf[i]
+                val rms = sqrt(energy / N)
+                if (rms < 40) { delay(50); continue }   // silence
+
+                // Hann window
+                for (i in 0 until N) {
+                    val w = 0.5f * (1f - cos(2.0 * PI * i / (N - 1)).toFloat())
+                    re[i] = buf[i] * w / 32768f
+                    im[i] = 0f
+                }
+
+                fft(re, im, N)
+
+                // Magnitude spectrum
+                val mag = FloatArray(N / 2) { b -> sqrt(re[b]*re[b] + im[b]*im[b]) }
+
+                // HPS: multiply mag[f] × mag[2f] × mag[3f] × mag[4f]
+                // This suppresses harmonics and amplifies the true F0
+                val binLo = (60f * N / SR).toInt().coerceAtLeast(2)
+                val binHi = (420f * N / SR).toInt().coerceAtMost(N / 5)
+
+                var bestBin = binLo
+                var bestHPS = 0f
+                for (b in binLo..binHi) {
+                    val h1 = mag[b]
+                    val h2 = if (b*2 < mag.size) mag[b*2] else 0f
+                    val h3 = if (b*3 < mag.size) mag[b*3] else 0f
+                    val h4 = if (b*4 < mag.size) mag[b*4] else 0f
+                    val hps = h1 * (h2 + 0.001f) * (h3 + 0.001f) * (h4 + 0.001f)
+                    if (hps > bestHPS) { bestHPS = hps; bestBin = b }
+                }
+
+                if (mag[bestBin] < 0.0002f) { delay(50); continue }  // too quiet
+
+                val f0 = bestBin.toFloat() * SR / N
+                val g  = if (f0 >= 165f) Gender.FEMALE else Gender.MALE
+
+                genderHistory.addLast(g)
+                if (genderHistory.size > GENDER_HIST) genderHistory.removeFirst()
+
+                val fCount = genderHistory.count { it == Gender.FEMALE }
+                // Require 70% majority to switch — stable detection
+                val newGender = when {
+                    fCount >= (GENDER_HIST * 0.7).toInt() -> Gender.FEMALE
+                    (genderHistory.size - fCount) >= (GENDER_HIST * 0.7).toInt() -> Gender.MALE
+                    else -> detectedGender   // not confident yet — keep current
+                }
+                if (newGender != detectedGender) {
+                    detectedGender = newGender
+                    Log.d(TAG, "Gender → $newGender F0=${f0.toInt()}Hz rms=${rms.toInt()} f=$fCount/${genderHistory.size}")
+                }
+                delay(80)
+            }
+            try { rec.stop(); rec.release() } catch (_: Exception) {}
+        }
+    }
+
+    // Cooley-Tukey radix-2 FFT (in-place)
+    private fun fft(re: FloatArray, im: FloatArray, n: Int) {
+        var j = 0
+        for (i in 1 until n) {
+            var bit = n shr 1
+            while (j and bit != 0) { j = j xor bit; bit = bit shr 1 }
+            j = j xor bit
+            if (i < j) {
+                re[i] = re[j].also { re[j] = re[i] }
+                im[i] = im[j].also { im[j] = im[i] }
+            }
+        }
+        var len = 2
+        while (len <= n) {
+            val ang = -2.0 * PI / len
+            val wRe = cos(ang).toFloat()
+            val wIm = sin(ang).toFloat()
+            var i = 0
+            while (i < n) {
+                var uRe = 1f; var uIm = 0f
+                for (k in 0 until len / 2) {
+                    val tRe = uRe * re[i+k+len/2] - uIm * im[i+k+len/2]
+                    val tIm = uRe * im[i+k+len/2] + uIm * re[i+k+len/2]
+                    re[i+k+len/2] = re[i+k] - tRe
+                    im[i+k+len/2] = im[i+k] - tIm
+                    re[i+k] += tRe; im[i+k] += tIm
+                    val nRe = uRe * wRe - uIm * wIm
+                    uIm = uRe * wIm + uIm * wRe; uRe = nRe
+                }
+                i += len
+            }
+            len = len shl 1
+        }
     }
 
 
