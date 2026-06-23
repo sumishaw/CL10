@@ -42,7 +42,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   String  targetLang       = 'hindi';
   double  subtitleSpeed    = 6.0;
   bool    ttsEnabled       = false;
-  String  ttsGender        = 'auto';   // 'auto', 'male', 'female'
+  String  ttsGender        = 'auto';
+  double  ttsSpeed         = 1.5;   // default 1.5x
 
   Future<void> _setTtsEnabled(bool on) async {
     await _ch.invokeMethod('setTtsEnabled', {'enabled': on});
@@ -52,6 +53,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Future<void> _setTtsGender(String gender) async {
     await _ch.invokeMethod('setTtsGender', {'gender': gender});
     if (mounted) setState(() => ttsGender = gender);
+  }
+
+  Future<void> _setTtsSpeed(double speed) async {
+    await _ch.invokeMethod('setTtsSpeed', {'speed': speed});
+    if (mounted) setState(() => ttsSpeed = speed);
   }
   String  statusMsg        = '';
   int     translationCount = 0;
@@ -732,6 +738,35 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               style: const TextStyle(color: Colors.white38, fontSize: 11),
             ),
           ),
+          const SizedBox(height: 12),
+          const Text('Voice speed',
+              style: TextStyle(color: Colors.white38, fontSize: 11)),
+          const SizedBox(height: 6),
+          Row(children: [1.0, 1.5, 2.0, 3.0, 4.0].map((spd) {
+            final selected = ttsSpeed == spd;
+            final label = spd == 1.0 ? '1×' : spd == 1.5 ? '1.5×'
+                        : spd == 2.0 ? '2×' : spd == 3.0 ? '3×' : '4×';
+            return Expanded(
+              child: GestureDetector(
+                onTap: () => _setTtsSpeed(spd),
+                child: Container(
+                  margin: const EdgeInsets.symmetric(horizontal: 2),
+                  padding: const EdgeInsets.symmetric(vertical: 7),
+                  decoration: BoxDecoration(
+                    color: selected ? accent : Colors.white10,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: selected ? accent : Colors.white12),
+                  ),
+                  child: Text(label,
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        fontSize: 12, fontWeight: FontWeight.bold,
+                        color: selected ? Colors.white : Colors.white54,
+                      )),
+                ),
+              ),
+            );
+          }).toList()),
         ],
       ],
     );
