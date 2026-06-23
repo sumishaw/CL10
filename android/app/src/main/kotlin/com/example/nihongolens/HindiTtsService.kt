@@ -2,9 +2,6 @@ package com.example.nihongolens
 
 import android.content.Context
 import android.media.AudioAttributes
-import android.media.AudioFormat
-import android.media.AudioRecord
-import android.media.MediaRecorder
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -12,7 +9,6 @@ import kotlinx.coroutines.*
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.LinkedBlockingQueue
-import kotlin.math.sqrt
 
 /**
  * HindiTtsService — TTS-driven subtitle sync
@@ -58,8 +54,9 @@ object HindiTtsService {
 
     // Single FIFO queue — one worker processes it sequentially
     // Unbounded so no sentence is ever dropped
-    private val queue = LinkedBlockingQueue<String>()
-    private var worker: Job? = null
+    private val queue      = LinkedBlockingQueue<String>()
+    private val readyQueue = LinkedBlockingQueue<Triple<String, ByteArray, Long>>()
+    private var worker:   Job? = null
     private var pitchJob: Job? = null
     private var mediaPlayer: android.media.MediaPlayer? = null
     private var lastSpokenNorm = ""
@@ -79,9 +76,8 @@ object HindiTtsService {
     fun setEnabled(on: Boolean) {
         enabled = on
         if (!on) {
-            queue.clear()
-            stopMp()
-            lastSpokenNorm = ""
+            queue.clear(); readyQueue.clear()
+            stopMp(); lastSpokenNorm = ""
         }
     }
 
@@ -99,11 +95,9 @@ object HindiTtsService {
     fun isSuppressed() = isSpeaking || System.currentTimeMillis() < speakingUntilMs
 
     fun destroy() {
-        pitchJob?.cancel()
-        worker?.cancel()
-        queue.clear()
-        stopMp()
-        scope.cancel()
+        pitchJob?.cancel(); worker?.cancel()
+        queue.clear(); readyQueue.clear()
+        stopMp(); scope.cancel()
     }
 
     // ── Enqueue sentence ─────────────────────────────────────────────────────
@@ -119,52 +113,56 @@ object HindiTtsService {
         Log.d(TAG, "speak() queued q=${queue.size} '${n.take(30)}'")
     }
 
-    // ── Single worker — fetch WAV → show subtitle → play → clear → repeat ────
-
     private fun startWorker() {
-        worker = scope.launch {
+        // Stage A: Fetch worker — converts text → WAV in background
+        val fetchJob2 = scope.launch {
             while (isActive) {
-                val text = queue.poll(2, java.util.concurrent.TimeUnit.SECONDS) ?: continue
+                val text = queue.poll(1, java.util.concurrent.TimeUnit.SECONDS) ?: continue
                 if (!enabled) continue
-
                 val emotion = detectEmotion(text)
                 val speed   = (emotionSpeed(emotion) * ttsSpeedMultiplier).coerceIn(0.5f, 4.0f)
-                val sid     = if ((if (selectedGender == Gender.AUTO) detectedGender
-                                   else selectedGender) == Gender.FEMALE)
-                                SID_FEMALE else SID_MALE
-
-                try {
-                    // Step 1: Fetch WAV
-                    val wav = fetchWav(text, sid, speed)
-                    if (wav == null || wav.size <= 44) {
-                        Log.w(TAG, "No WAV for '${text.take(30)}' — TTS server running?")
-                        // Still show subtitle even if TTS fails
-                        showSubtitle(text)
-                        delay(2_000)
-                        hideSubtitle()
-                        continue
-                    }
-
-                    // Step 2: Show subtitle exactly when speech starts
-                    showSubtitle(text)
-
-                    // Step 3: Play audio
-                    isSpeaking = true
-                    playWav(wav)
-                    isSpeaking = false
-                    speakingUntilMs = System.currentTimeMillis() + 300L
-
-                    // Step 4: Hide subtitle after speech ends
-                    hideSubtitle()
-
-                } catch (e: Exception) {
-                    Log.e(TAG, "Worker: ${e.message}")
-                    isSpeaking = false
-                    hideSubtitle()
+                val sid     = effectiveSid()
+                val wav     = fetchWav(text, sid, speed)
+                if (wav != null && wav.size > 44) {
+                    val sr   = readInt(wav, 24).coerceAtLeast(8_000)
+                    val nCh  = readShort(wav, 22).coerceAtLeast(1)
+                    val bits = readShort(wav, 34).coerceAtLeast(8)
+                    val dur  = ((wav.size - 44).toLong() * 1000) / (sr.toLong() * nCh * (bits / 8))
+                    // Drop oldest if backlogged — stay near real time
+                    while (readyQueue.size >= 3) readyQueue.poll()
+                    readyQueue.offer(Triple(text, wav, dur))
+                    Log.d(TAG, "Fetched ${dur}ms WAV ready q=${readyQueue.size}")
+                } else {
+                    Log.w(TAG, "Empty WAV — server running on :8766?")
                 }
-                // No delay — next sentence starts immediately
             }
         }
+
+        // Stage B: Play worker — plays WAV and shows subtitle in sync
+        worker = scope.launch {
+            while (isActive) {
+                val item = readyQueue.poll(1, java.util.concurrent.TimeUnit.SECONDS) ?: continue
+                if (!enabled) continue
+                val (text, wav, dur) = item
+                try {
+                    isSpeaking = true
+                    showSubtitle(text)
+                    playWav(wav, dur)
+                    hideSubtitle()
+                    speakingUntilMs = System.currentTimeMillis() + 200L
+                } catch (e: Exception) {
+                    Log.e(TAG, "Play: ${e.message}")
+                } finally {
+                    isSpeaking = false
+                }
+                // No delay — fetch worker already has next WAV ready
+            }
+        }
+    }
+
+    private fun effectiveSid(): Int {
+        val g = if (selectedGender == Gender.AUTO) detectedGender else selectedGender
+        return if (g == Gender.FEMALE) SID_FEMALE else SID_MALE
     }
 
     // ── Subtitle sync (show/hide driven by TTS) ───────────────────────────────
@@ -203,14 +201,8 @@ object HindiTtsService {
 
     // ── WAV playback ─────────────────────────────────────────────────────────
 
-    private suspend fun playWav(wav: ByteArray) {
-        val sr    = readInt(wav, 24).coerceAtLeast(8_000)
-        val nCh   = readShort(wav, 22).coerceAtLeast(1)
-        val bits  = readShort(wav, 34).coerceAtLeast(8)
-        val pcm   = (wav.size - 44).coerceAtLeast(0)
-        val durMs = (pcm.toLong() * 1000) / (sr.toLong() * nCh * (bits / 8))
-
-        Log.d(TAG, "playWav dur=${durMs}ms size=${wav.size}B sr=$sr")
+    private suspend fun playWav(wav: ByteArray, durMs: Long) {
+        Log.d(TAG, "playWav dur=${durMs}ms size=${wav.size}B")
 
         // Write WAV to cache dir — must happen on IO thread
         val f = withContext(Dispatchers.IO) {
@@ -279,110 +271,48 @@ object HindiTtsService {
         mediaPlayer = null
     }
 
-    // ── Pitch detection (mic picks up speaker audio) ─────────────────────────
+    // ── Gender detection — polls whisper_server /gender endpoint ─────────────
+    // whisper_server.py already has raw audio from Kokoro/Whisper and runs FFT.
+    // The /gender endpoint returns the actual speaker's F0-based gender.
+    // Polled every 1.5s, paused during TTS playback.
+    // History-smoothed over 8 readings to prevent rapid flipping.
 
     private fun startPitchDetector() {
         if (pitchJob?.isActive == true) return
         pitchJob = scope.launch {
-            val SR  = 16_000
-            val BUF = 2048
-            val minBuf = AudioRecord.getMinBufferSize(SR,
-                AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-
-            var rec: AudioRecord? = null
-            for (src in listOf(
-                MediaRecorder.AudioSource.UNPROCESSED,
-                MediaRecorder.AudioSource.VOICE_RECOGNITION,
-                MediaRecorder.AudioSource.DEFAULT)) {
-                try {
-                    val r = AudioRecord(src, SR, AudioFormat.CHANNEL_IN_MONO,
-                        AudioFormat.ENCODING_PCM_16BIT, maxOf(minBuf, BUF * 2))
-                    if (r.state == AudioRecord.STATE_INITIALIZED) {
-                        rec = r; break
-                    }
-                    r.release()
-                } catch (_: Exception) {}
-            }
-
-            if (rec == null) { Log.e(TAG, "PitchDetector: no AudioRecord"); return@launch }
-
-            try {
-                rec.startRecording()
-                val buf = ShortArray(BUF)
-                while (isActive) {
-                    // Pause during TTS — avoid detecting own voice
-                    if (isSuppressed()) { delay(200); continue }
-
-                    val read = rec.read(buf, 0, BUF)
-                    if (read < BUF) { delay(50); continue }
-
-                    // RMS — skip silence
-                    val rms = sqrt(buf.take(read).sumOf { it.toLong() * it }.toDouble() / read)
-                    if (rms < 100.0) { delay(30); continue }
-
-                    // YIN pitch estimation — reliable F0 detector
-                    val f0 = yinPitch(buf, read, SR)
-                    if (f0 <= 0f) { delay(50); continue }
-
-                    // F0 < 165Hz = male, ≥ 165Hz = female
-                    val g = if (f0 < 165f) Gender.MALE else Gender.FEMALE
-
-                    pitchHistory.addLast(g)
-                    if (pitchHistory.size > PITCH_HISTORY) pitchHistory.removeFirst()
-
-                    val fCount = pitchHistory.count { it == Gender.FEMALE }
-                    val majority = if (fCount > pitchHistory.size / 2) Gender.FEMALE else Gender.MALE
-                    if (majority != detectedGender) {
-                        detectedGender = majority
-                        Log.d(TAG, "Gender → $majority (F0=${f0.toInt()}Hz f=$fCount/${pitchHistory.size})")
-                    }
-                    delay(100)
+            Log.d(TAG, "Gender poller started → polling :8765/gender every 1.5s")
+            while (isActive) {
+                if (selectedGender == Gender.AUTO && !isSuppressed()) {
+                    try {
+                        val conn = URL("http://127.0.0.1:8765/gender")
+                            .openConnection() as HttpURLConnection
+                        conn.connectTimeout = 1_500
+                        conn.readTimeout    = 2_000
+                        conn.requestMethod  = "GET"
+                        if (conn.responseCode == 200) {
+                            val body = conn.inputStream.bufferedReader().readText()
+                            val json = org.json.JSONObject(body)
+                            val g    = json.optString("gender", "")
+                            val conf = json.optInt("confidence", 0)
+                            if (g == "female" || g == "male") {
+                                val gender = if (g == "female") Gender.FEMALE else Gender.MALE
+                                pitchHistory.addLast(gender)
+                                if (pitchHistory.size > PITCH_HISTORY) pitchHistory.removeFirst()
+                                val fCount   = pitchHistory.count { it == Gender.FEMALE }
+                                val majority = if (fCount > pitchHistory.size / 2)
+                                    Gender.FEMALE else Gender.MALE
+                                if (majority != detectedGender) {
+                                    detectedGender = majority
+                                    Log.d(TAG, "Gender → $majority ($g conf=$conf f=$fCount/${pitchHistory.size})")
+                                }
+                            }
+                        }
+                        conn.disconnect()
+                    } catch (_: Exception) { }
                 }
-            } finally {
-                try { rec.stop(); rec.release() } catch (_: Exception) {}
+                delay(1_500)
             }
         }
-    }
-
-    // YIN pitch detection algorithm — accurate F0 estimation from PCM
-    private fun yinPitch(buf: ShortArray, size: Int, sr: Int): Float {
-        val tau_max = sr / 80    // min 80Hz
-        val tau_min = sr / 500   // max 500Hz
-        val n       = size.coerceAtMost(1024)
-        val diff    = FloatArray(tau_max + 1)
-
-        // Step 1: Difference function
-        for (tau in 1..tau_max) {
-            var sum = 0.0
-            for (i in 0 until n - tau) {
-                val d = buf[i].toDouble() - buf[i + tau].toDouble()
-                sum += d * d
-            }
-            diff[tau] = sum.toFloat()
-        }
-
-        // Step 2: Cumulative mean normalized difference
-        diff[0] = 1f
-        var runSum = 0f
-        for (tau in 1..tau_max) {
-            runSum += diff[tau]
-            diff[tau] = if (runSum == 0f) 1f else diff[tau] * tau / runSum
-        }
-
-        // Step 3: Absolute threshold — find first tau below 0.15
-        for (tau in tau_min..tau_max) {
-            if (diff[tau] < 0.15f) {
-                // Parabolic interpolation for better accuracy
-                val better = if (tau in (tau_min + 1)..(tau_max - 1)) {
-                    val s0 = diff[tau - 1]; val s1 = diff[tau]; val s2 = diff[tau + 1]
-                    tau - (s2 - s0) / (2f * (2f * s1 - s0 - s2))
-                } else tau.toFloat()
-                return sr / better
-            }
-        }
-
-        // No clear pitch found
-        return 0f
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
