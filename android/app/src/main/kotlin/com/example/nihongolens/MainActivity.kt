@@ -174,6 +174,12 @@ class MainActivity : FlutterActivity() {
                     result.success(true)
                 }
 
+                "setTtsSpeed" -> {
+                    val speed = (call.argument<Double>("speed") ?: 1.5).toFloat()
+                    HindiTtsService.setSpeedMultiplier(speed)
+                    result.success(true)
+                }
+
                 "getLatestTranslation" ->
                     result.success(mapOf(
                         "original" to SpeechCaptureService.latestOriginal,
