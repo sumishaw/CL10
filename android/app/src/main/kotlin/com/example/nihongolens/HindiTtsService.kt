@@ -2,11 +2,8 @@ package com.example.nihongolens
 
 import android.content.Context
 import android.media.AudioAttributes
-import android.media.AudioFormat
 import android.media.AudioManager
-import android.media.AudioRecord
 import android.media.AudioTrack
-import android.media.MediaRecorder
 import android.util.Log
 import kotlinx.coroutines.*
 import org.json.JSONObject
@@ -337,111 +334,12 @@ object HindiTtsService {
 
     // ── Gender poller ─────────────────────────────────────────────────────────
 
+    // Gender detection is now handled by GenderAnalyzer.kt
+    // which uses AudioPlaybackCaptureConfiguration + MediaProjection
+    // to capture real media audio and run FFT gender analysis.
+    // This function is kept for compatibility but is a no-op.
     private fun startGenderPoller() {
-        genderJob = scope.launch {
-            Log.d(TAG, "Gender detector starting — REMOTE_SUBMIX internal audio")
-            while (isActive) {
-                if (selectedGender != Gender.AUTO || isSuppressed()) {
-                    delay(2_000); continue
-                }
-                try {
-                    sampleAndDetectGender()
-                } catch (e: Exception) {
-                    Log.w(TAG, "Gender sample: ${e.message}")
-                }
-                delay(2_000)
-            }
-        }
-    }
-
-    private suspend fun sampleAndDetectGender() = withContext(Dispatchers.IO) {
-        val SR      = 16_000
-        val SAMPLES = SR * 2   // 2s
-        val minBuf  = AudioRecord.getMinBufferSize(
-            SR, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-            .coerceAtLeast(SAMPLES * 2)
-
-        // REMOTE_SUBMIX (100) captures internal system audio — same as Live Captions
-        // This is what screen recorders use on Android 10+
-        // Fallback to VOICE_RECOGNITION (mic) if REMOTE_SUBMIX unavailable
-        val sources = listOf(100, MediaRecorder.AudioSource.VOICE_RECOGNITION,
-                             MediaRecorder.AudioSource.MIC)
-        var rec: AudioRecord? = null
-        for (src in sources) {
-            try {
-                val r = AudioRecord(src, SR, AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT, minBuf)
-                if (r.state == AudioRecord.STATE_INITIALIZED) {
-                    rec = r
-                    Log.d(TAG, "Gender AudioRecord src=$src")
-                    break
-                }
-                r.release()
-            } catch (_: Exception) {}
-        }
-        val record = rec ?: run {
-            Log.e(TAG, "Gender: no AudioRecord available")
-            return@withContext
-        }
-
-        val buf = ShortArray(SAMPLES)
-        try {
-            record.startRecording()
-            var read = 0
-            while (read < SAMPLES) {
-                val n = record.read(buf, read, SAMPLES - read)
-                if (n <= 0) break
-                read += n
-            }
-            record.stop()
-        } finally {
-            try { record.release() } catch (_: Exception) {}
-        }
-
-        if (isSuppressed()) return@withContext
-
-        // RMS check — very low threshold for mic picking up tablet speakers
-        var sq = 0.0
-        for (i in buf.indices) sq += buf[i].toLong() * buf[i]
-        val rms = kotlin.math.sqrt(sq / buf.size)
-        Log.d(TAG, "Gender sample rms=${rms.toInt()}")  // always log for diagnosis
-        if (rms < 10) { Log.d(TAG, "Gender: silence skip"); return@withContext }
-
-        // Convert to bytes and POST to whisper_server for FFT analysis
-        val pcm = ByteArray(buf.size * 2)
-        for (i in buf.indices) {
-            pcm[i*2]   = (buf[i].toInt() and 0xFF).toByte()
-            pcm[i*2+1] = (buf[i].toInt() shr 8 and 0xFF).toByte()
-        }
-
-        val conn = URL("http://127.0.0.1:8765/analyze_audio")
-            .openConnection() as HttpURLConnection
-        conn.requestMethod = "POST"
-        conn.doOutput = true
-        conn.connectTimeout = 2_000
-        conn.readTimeout = 3_000
-        conn.setRequestProperty("Content-Type", "application/octet-stream")
-        conn.outputStream.write(pcm)
-
-        if (conn.responseCode == 200) {
-            val json = JSONObject(conn.inputStream.bufferedReader().readText())
-            val g    = json.optString("gender", "")
-            val conf = json.optInt("confidence", 0)
-            conn.disconnect()
-
-            if (g == "female" || g == "male") {
-                val newG = if (g == "female") Gender.FEMALE else Gender.MALE
-                genderHistory.addLast(newG)
-                if (genderHistory.size > GENDER_HIST) genderHistory.removeFirst()
-                val fCount = genderHistory.count { it == Gender.FEMALE }
-                val majority = if (fCount > genderHistory.size / 2)
-                    Gender.FEMALE else Gender.MALE
-                if (majority != detectedGender) {
-                    detectedGender = majority
-                    Log.d(TAG, "Gender switched → $majority rms=${rms.toInt()} g=$g conf=$conf")
-                }
-            }
-        } else conn.disconnect()
+        Log.d(TAG, "Gender detection delegated to GenderAnalyzer (MediaProjection-based)")
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
