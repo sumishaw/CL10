@@ -416,8 +416,9 @@ class MainActivity : FlutterActivity() {
                 if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
                     val mgr = getSystemService(MEDIA_PROJECTION_SERVICE)
                         as android.media.projection.MediaProjectionManager
-                    val proj = mgr.getMediaProjection(resultCode, data)
-                    GenderAnalyzer.start(proj)
+                    mgr.getMediaProjection(resultCode, data)?.let { proj ->
+                        GenderAnalyzer.start(proj)
+                    }
                 }
 
                 pending?.success(true)
