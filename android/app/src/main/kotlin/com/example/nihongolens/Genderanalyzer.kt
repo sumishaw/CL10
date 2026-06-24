@@ -1,189 +1,148 @@
 package com.example.nihongolens
 
-import android.media.AudioAttributes
-import android.media.AudioFormat
-import android.media.AudioPlaybackCaptureConfiguration
-import android.media.AudioRecord
-import android.media.projection.MediaProjection
-import android.os.Build
 import android.util.Log
-import androidx.annotation.RequiresApi
-import kotlinx.coroutines.*
-import kotlinx.coroutines.currentCoroutineContext
 import kotlin.math.*
 
 /**
- * GenderAnalyzer — detects speaker gender from internal media audio.
+ * GenderAnalyzer — detects speaker gender from PCM audio fed by SpeechCaptureService.
  *
- * Uses AudioPlaybackCaptureConfiguration with MediaProjection to capture
- * audio from media players, browsers, YouTube — the same audio stream
- * that Live Captions uses.
+ * Architecture (v2 — shared PCM):
+ *   Android only allows ONE AudioPlaybackCaptureConfiguration per MediaProjection.
+ *   SpeechCaptureService owns the AudioRecord. After each raw read it calls
+ *   GenderAnalyzer.feedPcm(bytes, count) directly — no second AudioRecord needed.
  *
  * Method: spectral centroid + F0 band energy ratio on 2048-sample FFT windows.
- *   Female speakers: F0 165-300Hz, spectral centroid > 1800Hz
+ *   Female speakers: F0 165-300Hz, spectral centroid > 1600Hz
  *   Male speakers:   F0  80-165Hz, spectral centroid < 1600Hz
  *
- * Smoothed over 8 windows. Updates HindiTtsService.detectedGender.
- * Pauses during TTS playback to avoid self-detection.
+ * Smoothed over 3 windows (~150ms). Updates HindiTtsService.detectedGender.
+ * Skips analysis during TTS playback to avoid detecting own voice.
  */
 object GenderAnalyzer {
 
-    private const val TAG = "GenderAnalyzer"
+    private const val TAG  = "GenderAnalyzer"
+    private const val SR   = 16_000
+    private const val N    = 2048            // FFT window size — 128ms at 16kHz
+    private const val HIST = 3               // history depth — switch on 2/3 majority
 
-    private val scope    = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private var job: Job? = null
+    @Volatile var enabled = false
 
-    private val history  = ArrayDeque<HindiTtsService.Gender>()
-    private const val HIST = 3
+    private val history = ArrayDeque<HindiTtsService.Gender>()
 
-    fun start(projection: MediaProjection) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            Log.w(TAG, "AudioPlaybackCapture requires Android 10+")
-            return
-        }
-        job?.cancel()
+    // Accumulation buffer — filled from raw readBuf bytes fed by SpeechCaptureService
+    private val accum     = ShortArray(N)
+    private var accumFill = 0
+
+    // Reusable FFT arrays
+    private val re  = FloatArray(N)
+    private val im  = FloatArray(N)
+
+    fun start() {
+        enabled = true
         history.clear()
-        job = scope.launch { captureLoop(projection) }
-        Log.d(TAG, "GenderAnalyzer started")
+        accumFill = 0
+        Log.d(TAG, "GenderAnalyzer started (PCM-feed mode)")
+        CaptionLogger.log(TAG, "started")
     }
 
     fun stop() {
-        job?.cancel(); job = null
+        enabled = false
         history.clear()
+        accumFill = 0
         Log.d(TAG, "GenderAnalyzer stopped")
     }
 
-    @RequiresApi(Build.VERSION_CODES.Q)
-    private suspend fun captureLoop(projection: MediaProjection) {
-        val SR      = 16_000
-        val N       = 2048
-        val minBuf  = AudioRecord.getMinBufferSize(
-            SR, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-            .coerceAtLeast(N * 4)
+    /**
+     * Called by SpeechCaptureService on every raw AudioRecord.read().
+     * bytes: raw PCM 16-bit LE mono, count: number of valid bytes read.
+     * Runs on the AudioCaptureThread — must be fast (no I/O, no blocking).
+     */
+    fun feedPcm(bytes: ByteArray, count: Int) {
+        if (!enabled) return
+        // Skip during TTS playback — avoid analyzing own Hindi voice
+        if (HindiTtsService.isSuppressed()) { accumFill = 0; return }
 
-        // AudioPlaybackCaptureConfiguration — captures USAGE_MEDIA and USAGE_GAME
-        // This is exactly what Live Captions uses internally
-        val config = AudioPlaybackCaptureConfiguration.Builder(projection)
-            .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
-            .addMatchingUsage(AudioAttributes.USAGE_GAME)
-            .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
-            .build()
-
-        val rec = AudioRecord.Builder()
-            .setAudioFormat(AudioFormat.Builder()
-                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                .setSampleRate(SR)
-                .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
-                .build())
-            .setBufferSizeInBytes(minBuf)
-            .setAudioPlaybackCaptureConfig(config)
-            .build()
-
-        if (rec.state != AudioRecord.STATE_INITIALIZED) {
-            Log.e(TAG, "AudioRecord init failed")
-            rec.release(); return
+        // Convert bytes → shorts and fill accumulator
+        var i = 0
+        while (i + 1 < count && accumFill < N) {
+            val lo = bytes[i].toInt() and 0xFF
+            val hi = bytes[i + 1].toInt()
+            accum[accumFill++] = ((hi shl 8) or lo).toShort()
+            i += 2
         }
 
-        Log.d(TAG, "AudioPlaybackCapture ready SR=$SR N=$N")
-        rec.startRecording()
-
-        val buf  = ShortArray(N)
-        val re   = FloatArray(N)
-        val im   = FloatArray(N)
-
-        try {
-            while (currentCoroutineContext().isActive) {
-                // TTS playing: drain buffer to stay current, but don't analyze
-                // (avoids 4-6s blind spot; our USAGE_ASSISTANT audio is excluded from capture anyway)
-                if (HindiTtsService.isSuppressed()) {
-                    rec.read(buf, 0, N)   // drain so we don't analyze stale audio after TTS ends
-                    delay(50); continue
-                }
-                // Skip if gender manually set
-                if (HindiTtsService.selectedGender != HindiTtsService.Gender.AUTO) {
-                    delay(1_000); continue
-                }
-
-                val read = rec.read(buf, 0, N)
-                if (read < N) { delay(50); continue }
-
-                // RMS — skip silence
-                var energy = 0.0
-                for (i in 0 until N) energy += buf[i].toLong() * buf[i]
-                val rms = sqrt(energy / N)
-                if (rms < 30) { delay(20); continue }
-
-                // Hann window + copy to FFT arrays
-                for (i in 0 until N) {
-                    val w = 0.5f * (1f - cos(2.0 * PI * i / (N - 1)).toFloat())
-                    re[i] = buf[i] * w / 32768f
-                    im[i] = 0f
-                }
-
-                // In-place FFT
-                fft(re, im, N)
-
-                // Build magnitude spectrum
-                val mag = FloatArray(N / 2) { b ->
-                    sqrt(re[b] * re[b] + im[b] * im[b])
-                }
-
-                // Spectral centroid over speech range 200-4000 Hz
-                val speechLo = (200f * N / SR).toInt()
-                val speechHi = (4000f * N / SR).toInt().coerceAtMost(N / 2 - 1)
-                var wSum = 0.0; var eSum = 0.0
-                for (b in speechLo..speechHi) {
-                    val freq = b.toDouble() * SR / N
-                    wSum += freq * mag[b]
-                    eSum += mag[b]
-                }
-                val centroid = if (eSum < 1e-4) 0f else (wSum / eSum).toFloat()
-
-                // F0 band energy ratio (80-165 Hz male, 165-300 Hz female)
-                val maleLo   = (80f  * N / SR).toInt()
-                val maleHi   = (165f * N / SR).toInt()
-                val femaleLo = (165f * N / SR).toInt()
-                val femaleHi = (300f * N / SR).toInt()
-                val maleE    = (maleLo..maleHi).sumOf   { mag[it].toDouble() }.toFloat()
-                val femaleE  = (femaleLo..femaleHi).sumOf { mag[it].toDouble() }.toFloat()
-                val totalE   = maleE + femaleE + 1e-6f
-                val femaleRatio = femaleE / totalE
-
-                // Combined decision — widened female range, lowered male certainty bar
-                val detected: HindiTtsService.Gender? = when {
-                    centroid > 1800f && femaleRatio > 0.40f -> HindiTtsService.Gender.FEMALE
-                    centroid > 1600f && femaleRatio > 0.50f -> HindiTtsService.Gender.FEMALE
-                    centroid > 1500f && femaleRatio > 0.60f -> HindiTtsService.Gender.FEMALE
-                    centroid < 1500f && maleE > femaleE * 1.2f -> HindiTtsService.Gender.MALE
-                    centroid < 1700f && maleE > femaleE * 1.6f -> HindiTtsService.Gender.MALE
-                    else -> null  // ambiguous
-                }
-
-                detected?.let {
-                    history.addLast(it)
-                    if (history.size > HIST) history.removeFirst()
-
-                    val fCount = history.count { g -> g == HindiTtsService.Gender.FEMALE }
-                    // Switch on simple majority of 3 samples — fast response
-                    val majority: HindiTtsService.Gender = if (fCount > history.size / 2)
-                        HindiTtsService.Gender.FEMALE else HindiTtsService.Gender.MALE
-                    if (majority != HindiTtsService.detectedGender) {
-                        HindiTtsService.detectedGender = majority
-                        // Clear spoken tokens so next sentence replays in new voice
-                        HindiTtsService.spokenTokens.clear()
-                        Log.d(TAG, "Gender → $majority (centroid=${centroid.toInt()} femaleRatio=${"%.2f".format(femaleRatio)} rms=${rms.toInt()})")
-                        CaptionLogger.log(TAG, "Gender switched to $majority")
-                    }
-                }
-                delay(50)
-            }
-        } finally {
-            try { rec.stop(); rec.release() } catch (_: Exception) {}
-            Log.d(TAG, "captureLoop ended")
+        if (accumFill >= N) {
+            analyze()
+            accumFill = 0
         }
     }
 
-    // Cooley-Tukey radix-2 FFT
+    private fun analyze() {
+        // RMS — skip silence / very quiet audio
+        var energy = 0.0
+        for (s in accum) energy += s.toLong() * s
+        val rms = sqrt(energy / N)
+        if (rms < 30.0) return
+
+        // Hann window + load into FFT arrays
+        for (i in 0 until N) {
+            val w = 0.5f * (1f - cos(2.0 * PI * i / (N - 1)).toFloat())
+            re[i] = accum[i] * w / 32768f
+            im[i] = 0f
+        }
+
+        fft(re, im, N)
+
+        // Magnitude spectrum
+        val mag = FloatArray(N / 2) { b -> sqrt(re[b] * re[b] + im[b] * im[b]) }
+
+        // Spectral centroid over speech range 200–4000 Hz
+        val speechLo = (200f * N / SR).toInt()
+        val speechHi = (4000f * N / SR).toInt().coerceAtMost(N / 2 - 1)
+        var wSum = 0.0; var eSum = 0.0
+        for (b in speechLo..speechHi) {
+            wSum += b.toDouble() * SR / N * mag[b]
+            eSum += mag[b]
+        }
+        val centroid = if (eSum < 1e-4) 0f else (wSum / eSum).toFloat()
+
+        // F0 band energy (80–165 Hz male, 165–300 Hz female)
+        val maleLo   = (80f  * N / SR).toInt()
+        val maleHi   = (165f * N / SR).toInt()
+        val femaleLo = (165f * N / SR).toInt()
+        val femaleHi = (300f * N / SR).toInt()
+        val maleE    = (maleLo..maleHi).sumOf   { mag[it].toDouble() }.toFloat()
+        val femaleE  = (femaleLo..femaleHi).sumOf { mag[it].toDouble() }.toFloat()
+        val totalE   = maleE + femaleE + 1e-6f
+        val femaleRatio = femaleE / totalE
+
+        // Gender decision — widened female thresholds
+        val detected: HindiTtsService.Gender? = when {
+            centroid > 1800f && femaleRatio > 0.40f -> HindiTtsService.Gender.FEMALE
+            centroid > 1600f && femaleRatio > 0.50f -> HindiTtsService.Gender.FEMALE
+            centroid > 1500f && femaleRatio > 0.60f -> HindiTtsService.Gender.FEMALE
+            centroid < 1500f && maleE > femaleE * 1.2f -> HindiTtsService.Gender.MALE
+            centroid < 1700f && maleE > femaleE * 1.6f -> HindiTtsService.Gender.MALE
+            else -> null  // ambiguous frame — don't vote
+        } ?: return
+
+        history.addLast(detected)
+        if (history.size > HIST) history.removeFirst()
+
+        val fCount   = history.count { it == HindiTtsService.Gender.FEMALE }
+        val majority = if (fCount > history.size / 2) HindiTtsService.Gender.FEMALE
+                       else HindiTtsService.Gender.MALE
+
+        if (majority != HindiTtsService.detectedGender) {
+            HindiTtsService.detectedGender = majority
+            HindiTtsService.spokenTokens.clear()
+            Log.d(TAG, "Gender(audio)→$majority centroid=${centroid.toInt()} femaleRatio=${"%.2f".format(femaleRatio)} rms=${rms.toInt()}")
+            CaptionLogger.log(TAG, "Gender→$majority (c=${centroid.toInt()} fr=${"%.2f".format(femaleRatio)})")
+        }
+    }
+
+    // ── Cooley-Tukey radix-2 in-place FFT ────────────────────────────────────
+
     private fun fft(re: FloatArray, im: FloatArray, n: Int) {
         var j = 0
         for (i in 1 until n) {
