@@ -196,6 +196,7 @@ class LiveCaptionReader : AccessibilityService() {
                 HindiTtsService.stopAndClear()
                 sentenceTimerJob?.cancel(); sentenceTimerJob = null
                 sentenceBuffer = ""; lastBufferEnqueued = ""; lastEnqueuedWordCount = 0
+                lastEnqueuedText = ""
             }
             return null
         }
@@ -264,11 +265,13 @@ class LiveCaptionReader : AccessibilityService() {
     private var sentenceBuffer      = ""
     private var lastBufferEnqueued  = ""   // tracks last text actually sent to worker
     private var lastLCChangeMs      = 0L
-    private val SENTENCE_SILENCE_MS = 1_500L  // 1.5s — faster response
+    private val SENTENCE_SILENCE_MS = 1_200L
     private var sentenceTimerJob: Job? = null
-    private var lastEnqueuedWordCount = 0     // track how many words last sent
+    private var lastEnqueuedWordCount = 0
+    private var lastEnqueuedText      = ""
 
     private fun schedule(text: String) {
+        // Language detection
         val script = detectScript(text)
         if (script != confirmedLang) {
             if (script == pendingLang) {
@@ -276,7 +279,8 @@ class LiveCaptionReader : AccessibilityService() {
                     CaptionLogger.log(TAG, "LANG $confirmedLang→$script")
                     confirmedLang = script; pendingLang = ""; pendingCount = 0
                     lastEnqueued = ""; lastRawFull = ""; lastEnqueuedSents.clear()
-                    sentenceBuffer = ""; lastBufferEnqueued = ""; lastEnqueuedWordCount = 0
+                    sentenceBuffer = ""; lastBufferEnqueued = ""
+                    lastEnqueuedWordCount = 0; lastEnqueuedText = ""
                     queue.clear(); expectedSeq = seqCounter.get() + 1
                 }
             } else { pendingLang = script; pendingCount = 1 }
@@ -284,62 +288,62 @@ class LiveCaptionReader : AccessibilityService() {
 
         sentenceBuffer = text
         lastLCChangeMs = System.currentTimeMillis()
-        val trimmed = text.trim()
-        val currentWords = trimmed.split(Regex("\\s+")).filter { it.isNotBlank() }
-        val newWordCount = currentWords.size
 
-        // TRIGGER 1: sentence-ending punctuation → translate after brief settle
+        val trimmed   = text.trim()
+        val words     = trimmed.split(Regex("\\s+")).filter { it.isNotBlank() }
+        val wordCount = words.size
+
+        // Always cap at 12 words for translation — keeps TTS under 3s per chunk
+        val toTranslate = if (wordCount > 12) words.take(12).joinToString(" ") else trimmed
+
+        // TRIGGER 1: ends with sentence punctuation → translate after 200ms settle
         val endsWithPunct = trimmed.endsWith(".") || trimmed.endsWith("?") ||
                             trimmed.endsWith("!") || trimmed.endsWith("。") ||
                             trimmed.endsWith("？") || trimmed.endsWith("！") ||
                             trimmed.endsWith("…")
-        if (endsWithPunct) {
+        if (endsWithPunct && wordCount >= 3) {
             sentenceTimerJob?.cancel(); pendingJob?.cancel()
             pendingJob = scope.launch {
-                delay(250)
-                val buf = capWords(sentenceBuffer.trim(), 20)
-                val bufWords = buf.split(Regex("\\s+")).size
-                if (buf.isNotBlank() && buf != lastBufferEnqueued && bufWords > lastEnqueuedWordCount) {
-                    lastBufferEnqueued = buf; lastEnqueuedWordCount = bufWords
-                    enqueue(buf); sentenceBuffer = ""
+                delay(200)
+                val t = capWords(sentenceBuffer.trim(), 12)
+                if (t.isNotBlank() && t != lastEnqueuedText) {
+                    lastEnqueuedText = t; lastEnqueuedWordCount = wordCount
+                    enqueue(t); sentenceBuffer = ""
                 }
             }
             return
         }
 
-        // TRIGGER 2: enough new words accumulated (8+ words since last enqueue)
-        // This fires during fast continuous speech without punctuation
-        val wordsGrown = newWordCount - lastEnqueuedWordCount
-        if (wordsGrown >= 8 && newWordCount >= 8) {
+        // TRIGGER 2: grew by 6+ words since last translation
+        val grown = wordCount - lastEnqueuedWordCount
+        if (grown >= 6 && wordCount >= 6) {
             sentenceTimerJob?.cancel(); pendingJob?.cancel()
             pendingJob = scope.launch {
-                delay(300)  // brief settle for word corrections
-                val buf = capWords(sentenceBuffer.trim(), 20)
-                val bufWords = buf.split(Regex("\\s+")).size
-                if (buf.isNotBlank() && bufWords > lastEnqueuedWordCount) {
-                    lastBufferEnqueued = buf; lastEnqueuedWordCount = bufWords
-                    enqueue(buf); sentenceBuffer = ""
+                delay(200)  // brief settle for word correction
+                val t = capWords(sentenceBuffer.trim(), 12)
+                if (t.isNotBlank() && t != lastEnqueuedText) {
+                    lastEnqueuedText = t; lastEnqueuedWordCount = wordCount
+                    enqueue(t); sentenceBuffer = ""
                 }
             }
             return
         }
 
-        // TRIGGER 3: silence fallback — 1.5s no new LC text
+        // TRIGGER 3: silence — 1.2s no change
         sentenceTimerJob?.cancel()
         sentenceTimerJob = scope.launch {
             delay(SENTENCE_SILENCE_MS)
-            val buf = capWords(sentenceBuffer.trim(), 20)
-            val bufWords = buf.split(Regex("\\s+")).size
-            if (buf.isNotBlank() && buf != lastBufferEnqueued && bufWords > lastEnqueuedWordCount) {
+            val t = capWords(sentenceBuffer.trim(), 12)
+            if (t.isNotBlank() && t != lastEnqueuedText && wordCount >= 3) {
                 CaptionLogger.log(TAG, "SILENCE translate")
-                lastBufferEnqueued = buf; lastEnqueuedWordCount = bufWords
-                enqueue(buf); sentenceBuffer = ""
+                lastEnqueuedText = t; lastEnqueuedWordCount = wordCount
+                enqueue(t); sentenceBuffer = ""
             }
         }
         pendingJob?.cancel()
     }
 
-    private fun capWords(text: String, maxWords: Int): String {
+        private fun capWords(text: String, maxWords: Int): String {
         val words = text.trim().split(Regex("\\s+"))
         return if (words.size <= maxWords) text.trim()
                else words.take(maxWords).joinToString(" ")
