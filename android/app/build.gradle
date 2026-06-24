@@ -6,12 +6,12 @@ plugins {
 
 android {
     namespace 'com.example.nihongolens'
-    compileSdk 35
+    compileSdk 36
 
     defaultConfig {
         applicationId "com.example.nihongolens"
         minSdk 29          // API 29 = Android 10, required for AudioPlaybackCaptureConfiguration
-        targetSdk 35
+        targetSdk 36
         versionCode 8
         versionName "8.0"
         multiDexEnabled true
