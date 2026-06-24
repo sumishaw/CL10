@@ -254,8 +254,8 @@ class SpeechCaptureService : Service() {
 
         capturing.set(true)
         ar.startRecording()
-        // Start GenderAnalyzer — it will receive PCM via feedPcm() from our capture loop
-        GenderAnalyzer.start()
+        // Start GenderAnalyzer with dedicated USAGE_MEDIA capture (separate from our capture)
+        GenderAnalyzer.start(sharedProjection)
         updateNotification("Translating video audio to Hindi…")
         mainHandler.post { OverlayService.updateText("", "") }
 
@@ -280,8 +280,8 @@ class SpeechCaptureService : Service() {
                 if (read < 0) break
                 if (read == 0) continue
 
-                // Feed raw PCM to GenderAnalyzer — shares our AudioRecord, no second capture needed
-                GenderAnalyzer.feedPcm(readBuf, read)
+                // GenderAnalyzer has its own AudioPlaybackCaptureConfiguration loop
+                // No need to feed PCM manually — it reads USAGE_MEDIA independently
 
                 var src = 0
                 while (src < read) {
