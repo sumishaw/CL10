@@ -295,47 +295,40 @@ class LiveCaptionReader : AccessibilityService() {
         sentenceBuffer = text
         lastLCChangeMs = System.currentTimeMillis()
 
-        // Check if text ends with sentence-ending punctuation → translate immediately
+        // TRIGGER 1: sentence-ending punctuation → translate after brief settle
         val trimmed = text.trim()
         val endsWithPunct = trimmed.endsWith(".") || trimmed.endsWith("?") ||
                             trimmed.endsWith("!") || trimmed.endsWith("。") ||
                             trimmed.endsWith("？") || trimmed.endsWith("！") ||
                             trimmed.endsWith("…")
-
         if (endsWithPunct) {
-            // Complete sentence detected — translate now
             sentenceTimerJob?.cancel()
             pendingJob?.cancel()
             pendingJob = scope.launch {
-                delay(150)  // brief settle for LC word correction
-                enqueue(sentenceBuffer)
-                sentenceBuffer = ""
+                delay(200)  // brief settle for LC corrections
+                if (sentenceBuffer.isNotBlank()) {
+                    enqueue(sentenceBuffer)
+                    sentenceBuffer = ""
+                }
             }
             return
         }
 
-        // No sentence end yet — reset silence timer
+        // TRIGGER 2: silence — LC stopped updating for 3s
+        // Only reset timer when text actually grows (new words added)
         sentenceTimerJob?.cancel()
         sentenceTimerJob = scope.launch {
             delay(SENTENCE_SILENCE_MS)
-            // LC stopped updating for 2.5s — treat as sentence end
             if (sentenceBuffer.isNotBlank()) {
-                CaptionLogger.log(TAG, "SILENCE: translating after ${SENTENCE_SILENCE_MS}ms")
+                CaptionLogger.log(TAG, "SILENCE translate after ${SENTENCE_SILENCE_MS}ms")
                 enqueue(sentenceBuffer)
                 sentenceBuffer = ""
             }
         }
 
-        // Also keep debounce as safety net for very fast speech
+        // NOTE: removed 600ms debounce — it was firing mid-sentence causing partial translations
+        // Only punct + silence triggers are used now
         pendingJob?.cancel()
-        pendingJob = scope.launch {
-            delay(600)  // longer debounce — give LC time to complete word
-            val current = sentenceBuffer
-            if (current.isNotBlank() && current.length > (lastEnqueued.length + 12)) {
-                // Meaningful new content accumulated — translate
-                enqueue(current)
-            }
-        }
     }
 
     private fun enqueue(text: String) {
