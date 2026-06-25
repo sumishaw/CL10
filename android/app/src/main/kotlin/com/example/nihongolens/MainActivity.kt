@@ -106,9 +106,10 @@ class MainActivity : FlutterActivity() {
                 "startOverlay" -> {
                     val i = Intent(this, OverlayService::class.java)
                     startForegroundServiceCompat(i)
-                    // NOTE: mic NOT muted — GenderAnalyzer uses USAGE_MEDIA internal audio.
-                    // isSuppressed() in micLoop handles TTS separation in fallback mode.
                     result.success(true)
+                    // Request projection AFTER result.success() — deferred so MethodChannel
+                    // is fully done before we launch the screen capture permission dialog
+                    mainHandler.post { requestGenderProjection() }
                 }
 
                 "stopOverlay" -> {
@@ -296,6 +297,9 @@ class MainActivity : FlutterActivity() {
     fun onLiveCaptionReaderConnected() {
         mainHandler.post {
             methodChannel?.invokeMethod("onLiveCaptionReaderConnected", null)
+            // Ensure gender projection is active — handles case where LC was enabled
+            // before the overlay started, or projection expired
+            requestGenderProjection()
         }
     }
 
@@ -398,6 +402,25 @@ class MainActivity : FlutterActivity() {
             } else {
                 pending?.success(false)
             }
+        }
+    }
+
+    // ── Gender projection ────────────────────────────────────────────────────
+
+    private fun requestGenderProjection() {
+        if (lcProjection != null) {
+            // Already have projection — start GenderAnalyzer immediately
+            if (LiveCaptionReader.isRunning) GenderAnalyzer.start(lcProjection)
+            return
+        }
+        val mgr = getSystemService(MEDIA_PROJECTION_SERVICE)
+            as android.media.projection.MediaProjectionManager
+        try {
+            @Suppress("DEPRECATION")
+            startActivityForResult(mgr.createScreenCaptureIntent(), REQ_GENDER_PROJECTION)
+        } catch (e: Exception) {
+            Log.w(TAG, "Gender projection request failed: ${e.message}")
+            CaptionLogger.log("MainActivity", "Gender projection failed: ${e.message}")
         }
     }
 
