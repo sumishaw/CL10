@@ -40,7 +40,9 @@ class MainActivity : FlutterActivity() {
     private val CHANNEL = "overlay_channel"
     private var methodChannel: MethodChannel? = null
 
-    @Volatile private var pendingProjectionResult: MethodChannel.Result? = null
+    @Volatile private var pendingProjectionResult:    MethodChannel.Result? = null
+    @Volatile private var pendingGenderOnly          = false
+    @Volatile private var isSpeechCaptureUserStarted = false
     @Volatile private var pendingGenderResult:     MethodChannel.Result? = null
 
     private val healthExecutor = Executors.newSingleThreadExecutor()
@@ -107,14 +109,17 @@ class MainActivity : FlutterActivity() {
                     val i = Intent(this, OverlayService::class.java)
                     startForegroundServiceCompat(i)
                     result.success(true)
-                    // GenderAnalyzer uses Visualizer API — no MediaProjection needed
-                    // Start immediately after overlay starts
-                    mainHandler.post { GenderAnalyzer.start() }
+                    // Request screen capture permission for GenderAnalyzer internal audio
+                    mainHandler.post { requestProjectionForGender() }
                 }
 
                 "stopOverlay" -> {
                     stopService(Intent(this, OverlayService::class.java))
                     GenderAnalyzer.stop()
+                    // Also stop gender-only SCS if it was started
+                    if (SpeechCaptureService.isRunning && !isSpeechCaptureUserStarted) {
+                        stopService(Intent(this, SpeechCaptureService::class.java))
+                    }
                     result.success(true)
                 }
 
@@ -122,10 +127,12 @@ class MainActivity : FlutterActivity() {
 
                 "startSpeechCapture" -> {
                     stopIdlePoll()
+                    isSpeechCaptureUserStarted = true
                     requestAudioThenProjection(result)
                 }
 
                 "stopSpeechCapture" -> {
+                    isSpeechCaptureUserStarted = false
                     stopService(Intent(this, SpeechCaptureService::class.java))
                     result.success(true)
                     startIdlePoll()
@@ -333,6 +340,27 @@ class MainActivity : FlutterActivity() {
 
     // ── Permission + projection flow ──────────────────────────────────────────
 
+    // ── Gender-only projection ────────────────────────────────────────────────
+
+    private fun requestProjectionForGender() {
+        if (SpeechCaptureService.isRunning) {
+            // Full capture running — GenderAnalyzer already has projection
+            CaptionLogger.log("MainActivity", "SCS running — GenderAnalyzer already has projection")
+            return
+        }
+        if (!android.provider.Settings.canDrawOverlays(this)) return
+        if (androidx.core.content.ContextCompat.checkSelfPermission(this, android.Manifest.permission.RECORD_AUDIO)
+            != android.content.pm.PackageManager.PERMISSION_GRANTED) return
+        pendingGenderOnly = true
+        // Use same projection flow as audio capture — SCS handles getMediaProjection() legally
+        val dummy = object : io.flutter.plugin.common.MethodChannel.Result {
+            override fun success(r: Any?) {}
+            override fun error(c: String, m: String?, d: Any?) {}
+            override fun notImplemented() {}
+        }
+        requestMediaProjection(dummy)
+    }
+
     private fun requestAudioThenProjection(result: MethodChannel.Result) {
         if (!Settings.canDrawOverlays(this)) { result.success(false); return }
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
@@ -384,16 +412,21 @@ class MainActivity : FlutterActivity() {
         if (requestCode == REQ_MEDIA_PROJECTION) {
             val pending = pendingProjectionResult
             pendingProjectionResult = null
+            val genderOnly = pendingGenderOnly
+            pendingGenderOnly = false
 
             if (resultCode == Activity.RESULT_OK && data != null) {
                 val i = Intent(this, SpeechCaptureService::class.java).apply {
                     putExtra(SpeechCaptureService.EXTRA_RESULT_CODE, resultCode)
                     putExtra(SpeechCaptureService.EXTRA_RESULT_DATA, data)
+                    if (genderOnly) putExtra(SpeechCaptureService.EXTRA_GENDER_ONLY, true)
                 }
                 startForegroundServiceCompat(i)
-                pending?.success(true)
+                if (!genderOnly) pending?.success(true)
+                else CaptionLogger.log("MainActivity", "Gender-only SCS started")
             } else {
                 pending?.success(false)
+                if (genderOnly) GenderAnalyzer.lastStatus = "permission denied"
             }
         }
     }
