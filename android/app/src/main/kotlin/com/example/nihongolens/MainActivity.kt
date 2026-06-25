@@ -344,21 +344,22 @@ class MainActivity : FlutterActivity() {
 
     private fun requestProjectionForGender() {
         if (SpeechCaptureService.isRunning) {
-            // Full capture running — GenderAnalyzer already has projection
-            CaptionLogger.log("MainActivity", "SCS running — GenderAnalyzer already has projection")
+            CaptionLogger.log("MainActivity", "SCS already running — GenderAnalyzer has projection")
             return
         }
-        if (!android.provider.Settings.canDrawOverlays(this)) return
-        if (androidx.core.content.ContextCompat.checkSelfPermission(this, android.Manifest.permission.RECORD_AUDIO)
-            != android.content.pm.PackageManager.PERMISSION_GRANTED) return
+        CaptionLogger.log("MainActivity", "requestProjectionForGender: overlay=${Settings.canDrawOverlays(this)} audio=${ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED}")
         pendingGenderOnly = true
-        // Use same projection flow as audio capture — SCS handles getMediaProjection() legally
-        val dummy = object : io.flutter.plugin.common.MethodChannel.Result {
-            override fun success(r: Any?) {}
-            override fun error(c: String, m: String?, d: Any?) {}
+        // Reuse full audio+projection request flow — handles RECORD_AUDIO permission automatically
+        val dummy = object : MethodChannel.Result {
+            override fun success(r: Any?) {
+                CaptionLogger.log("MainActivity", "gender projection dummy result: $r")
+            }
+            override fun error(c: String, m: String?, d: Any?) {
+                CaptionLogger.log("MainActivity", "gender projection error: $c $m")
+            }
             override fun notImplemented() {}
         }
-        requestMediaProjection(dummy)
+        requestAudioThenProjection(dummy)
     }
 
     private fun requestAudioThenProjection(result: MethodChannel.Result) {
