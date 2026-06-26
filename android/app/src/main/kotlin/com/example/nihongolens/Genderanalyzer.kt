@@ -5,6 +5,7 @@ import android.media.AudioFormat
 import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
 import android.media.projection.MediaProjection
+import android.content.Context
 import android.os.Build
 import android.util.Log
 import kotlinx.coroutines.*
@@ -30,6 +31,12 @@ import java.util.concurrent.atomic.AtomicLong
  *   emotion     — one of 23 voice types detected from the above features
  */
 object GenderAnalyzer {
+
+    private lateinit var appContext: Context
+
+    fun initialize(context: Context) {
+        appContext = context.applicationContext
+    }
 
     private const val TAG           = "GenderAnalyzer"
     private const val SR            = 16_000
@@ -175,8 +182,7 @@ object GenderAnalyzer {
 
         // Open circular PCM file for TTS server to read BG audio from
         try {
-            val filesDir = android.app.ActivityThread.currentApplication()
-                ?.filesDir?.absolutePath ?: "/data/data/com.example.nihongolens/files"
+            val filesDir = appContext.filesDir.absolutePath
             val bgPath = "$filesDir/bg_pcm.raw"
             bgFile = RandomAccessFile(bgPath, "rw")
             bgFile?.setLength(BG_FILE_BYTES.toLong())  // pre-allocate 96KB circular buffer
@@ -444,8 +450,6 @@ object GenderAnalyzer {
 
     // ── Background audio streaming ───────────────────────────────────────────
 
-            conn.responseCode         // trigger send
-            conn.disconnect()
     // ── Background audio (Android handles mixing automatically) ──────────────
     // USAGE_MEDIA (video) and USAGE_ASSISTANT (TTS) are mixed by Android AudioManager.
     // No manual ducking needed — AudioFocus system handles volume balance.
