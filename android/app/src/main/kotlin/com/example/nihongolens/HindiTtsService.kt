@@ -44,13 +44,20 @@ object HindiTtsService {
 
     enum class Gender  { AUTO, MALE, FEMALE }
     enum class Emotion {
+        // Basic
         NEUTRAL, HAPPY, SAD, ANGRY, FEARFUL, SURPRISED, DISGUST,
+        // Breathive
         BREATHY, WHISPERY, HUSHED, MURMURED,
+        // Warm
         VELVETY, SULTRY, WARM, TENDER,
+        // Intense
         HUSKY, RASPY, GRAVELLY, STRAINED,
+        // Rhythmic
         SIGHING, PANTING, MOANING, GASPING,
-        SINGING;   // sustained vocal performance
+        // Vocal performance
+        SINGING;
 
+        // Speed multiplier — combined with user speed setting
         val speedMult: Float get() = when (this) {
             HAPPY->1.12f; SAD->0.85f; ANGRY->1.05f; FEARFUL->0.95f
             SURPRISED->1.08f; DISGUST->0.90f
@@ -58,19 +65,7 @@ object HindiTtsService {
             VELVETY->0.92f; SULTRY->0.88f; WARM->0.95f; TENDER->0.90f
             HUSKY->0.93f; RASPY->1.00f; GRAVELLY->0.85f; STRAINED->1.10f
             SIGHING->0.80f; PANTING->1.20f; MOANING->0.75f; GASPING->1.15f
-            SINGING->0.88f
-            else->1.00f
-        }
-        val pitchMult: Float get() = when (this) {
-            HAPPY->1.10f; SAD->0.92f; ANGRY->1.02f; FEARFUL->1.08f
-            SURPRISED->1.12f; DISGUST->0.90f
-            BREATHY->0.95f; WHISPERY->0.90f; HUSHED->0.93f; MURMURED->0.88f
-            VELVETY->0.96f; SULTRY->0.88f; WARM->0.97f; TENDER->0.94f
-            HUSKY->0.92f; RASPY->0.88f; GRAVELLY->0.85f; STRAINED->1.08f
-            SIGHING->0.90f; PANTING->1.05f; MOANING->0.87f; GASPING->1.12f
-            SINGING->1.00f  // neutral pitch — melody is in the content
-            SINGING->1.00f
-            else->1.00f
+            SINGING->0.88f; else->1.00f
         }
         val category: String get() = when(this) {
             NEUTRAL,HAPPY,SAD,ANGRY,FEARFUL,SURPRISED,DISGUST -> "basic"
@@ -82,12 +77,13 @@ object HindiTtsService {
         }
     }
 
+    // Set by GenderAnalyzer from acoustic analysis
+    @Volatile var currentEmotion: Emotion = Emotion.NEUTRAL
+
     @JvmField @Volatile var enabled           = false
     @JvmField @Volatile var selectedGender    = Gender.AUTO
     @Volatile var ttsSpeedMultiplier          = 1.5f
     @Volatile var detectedGender              = Gender.MALE
-    // Set by GenderAnalyzer from audio analysis — drives TTS emotion + voice profile
-    @Volatile var currentEmotion: Emotion     = Emotion.NEUTRAL
     @Volatile var isSpeaking                  = false
     @Volatile private var speakingUntilMs     = 0L
 
@@ -99,9 +95,10 @@ object HindiTtsService {
     // ── FIFO queues (unbounded — never drop sentences) ────────────────────────
     data class FetchItem(
         val text: String, val gender: String, val speed: Float,
+        val srcText: String = "", val token: Int = 0,
+        val emotion: Emotion = Emotion.NEUTRAL,
         val volume: Float = 1.0f, val pitchSlope: String = "flat",
-        val srcText: String = "", val emotion: Emotion = Emotion.NEUTRAL,
-        val bgSeq: Int = 0   // background audio seq number at enqueue time
+        val bgSeq: Int = 0
     )
     data class PlayItem (val text: String, val wav: ByteArray, val durMs: Long)
 
@@ -148,12 +145,13 @@ object HindiTtsService {
     fun isSuppressed() = isSpeaking || System.currentTimeMillis() < speakingUntilMs
 
     fun stopAndClear() {
+        sessionToken++   // invalidate all in-flight translations
         fetchQueue.clear(); playQueue.clear()
         stopAudio()
         isSpeaking = false
         speakingUntilMs = System.currentTimeMillis() + 2_000L
         spokenTokens.clear()
-        Log.d(TAG, "Stopped (LC silent)")
+        Log.d(TAG, "Stopped (LC silent) token=$sessionToken")
     }
 
     fun destroy() {
@@ -173,20 +171,15 @@ object HindiTtsService {
         if (spokenTokens.putIfAbsent(token, true) != null) return
         if (spokenTokens.size > 300) spokenTokens.clear()
 
-        // Read voice profile from GenderAnalyzer (set by audio analysis)
+        // Use acoustic emotion (from GenderAnalyzer) — fall back to text
         val audioEmotion = currentEmotion
         val textEmotion  = detectTextEmotion(n)
         val emotion      = if (audioEmotion != Emotion.NEUTRAL) audioEmotion else textEmotion
-
-        // Speed: emotion multiplier × user preference, capped
-        val emotionSpeedMult = emotion.speedMult.coerceIn(0.75f, 1.15f)
-        val speed = (emotionSpeedMult * ttsSpeedMultiplier).coerceIn(0.5f, 3.0f)
-
-        // Read volume and pitch_slope from live voice profile
-        // Emotion character is conveyed via Piper native params on the server
-        val profile    = GenderAnalyzer.currentProfile
-        val volume     = profile.volume.coerceIn(0.5f, 1.8f)
-        val pitchSlope = profile.pitchSlope
+        val speed        = (emotion.speedMult.coerceIn(0.75f, 1.15f) * ttsSpeedMultiplier)
+                               .coerceIn(0.5f, 3.0f)
+        val profile      = GenderAnalyzer.currentProfile
+        val volume       = profile.volume.coerceIn(0.5f, 1.8f)
+        val pitchSlope   = profile.pitchSlope
         // Always store "auto" — gender resolved at fetch time so switches apply immediately
         // even for sentences already in queue
         val genderTag = when (selectedGender) {
@@ -197,14 +190,9 @@ object HindiTtsService {
 
         // FIFO: never drop sentences — every sentence gets spoken in order
         // fetchQueue is unbounded LinkedBlockingQueue so memory is safe
-        // Snapshot background audio sequence number at THIS moment
-        // Server will retrieve the BG chunk captured at this exact time
         val bgSeq = BackgroundMusicRecorder.currentSeq.get()
-        fetchQueue.offer(FetchItem(
-            text=n, gender=genderTag, speed=speed,
-            volume=volume, pitchSlope=pitchSlope,
-            srcText=srcText, emotion=emotion, bgSeq=bgSeq
-        ))
+        fetchQueue.offer(FetchItem(n, genderTag, speed, srcText, sessionToken,
+            emotion, volume, pitchSlope, bgSeq))
     }
 
 
@@ -237,8 +225,12 @@ object HindiTtsService {
                     val textToSpeak = if (verbGender == "female")
                         toFeminineHindi(item.text) else item.text
 
-                    val itemWithText = item.copy(text = textToSpeak)
-                    val wav = fetchWav(itemWithText, resolvedGender)
+                    // Discard if LC went away while we were translating
+                    if (item.token != sessionToken) {
+                        CaptionLogger.log(TAG, "DISCARD stale token ${item.token}≠$sessionToken")
+                        continue
+                    }
+                    val wav = fetchWav(item.copy(text = textToSpeak), resolvedGender)
                     if (wav != null && wav.size > 44) {
                         val sr  = readInt(wav, 24).coerceAtLeast(8_000)
                         val nch = readShort(wav, 22).coerceAtLeast(1)
@@ -265,14 +257,12 @@ object HindiTtsService {
                     // No audio focus request — USAGE_ASSISTANT handles exclusion from LC
                     // AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE was pausing video → LC gap → loop
                     withContext(Dispatchers.Main) {
+                        // Sync subtitle to exactly what is being spoken (FIFO display)
                         OverlayService.showTtsText(item.text)
                     }
-                    // Duck background audio while TTS speaks
-                    GenderAnalyzer.duckBackground()
                     playWav(item.wav, item.durMs)
-                    // Restore background audio after TTS finishes
-                    GenderAnalyzer.unduckBackground()
                     withContext(Dispatchers.Main) {
+                        // TTS finished — advance subtitle to next queued item
                         OverlayService.clearTtsText()
                     }
                     speakingUntilMs = System.currentTimeMillis() + 300L
@@ -292,20 +282,18 @@ object HindiTtsService {
             var conn: HttpURLConnection? = null
             try {
                 val enc = java.net.URLEncoder.encode(item.text, "UTF-8")
-                // Send emotion NAME — server maps to Piper native params (noise_scale, noise_w)
-                // No pitch shift, no noise injection — all artifact-free
                 val url = "$TTS_URL?text=$enc&gender=$resolvedGender" +
-                    "&speed=${String.format("%.3f", item.speed)}" +
+                    "&speed=${String.format("%.3f",item.speed)}" +
                     "&emotion=${item.emotion.name}" +
-                    "&volume=${String.format("%.3f", item.volume)}" +
+                    "&volume=${String.format("%.3f",item.volume)}" +
                     "&pitch_slope=${item.pitchSlope}" +
                     "&bg_seq=${item.bgSeq}"
                 CaptionLogger.log("HindiTTS", "[${item.emotion.name}/${item.emotion.category}] " +
-                    "spd=${String.format("%.2f",item.speed)} " +
-                    "vol=${String.format("%.2f",item.volume)} slope=${item.pitchSlope}")
+                    "spd=${String.format("%.2f",item.speed)} vol=${String.format("%.2f",item.volume)} " +
+                    "slope=${item.pitchSlope} bg_seq=${item.bgSeq}")
                 conn = URL(url).openConnection() as HttpURLConnection
-                conn.connectTimeout = 8_000
-                conn.readTimeout    = 40_000  // increased — Piper synthesis can take time
+                conn.connectTimeout = 5_000
+                conn.readTimeout    = 20_000
                 if (conn.responseCode == 200) conn.inputStream.readBytes() else null
             } catch (e: Exception) { null }
             finally { try { conn?.disconnect() } catch (_: Exception) {} }
@@ -363,14 +351,10 @@ object HindiTtsService {
         val manager = am ?: return
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
             val req = android.media.AudioFocusRequest.Builder(
-                // MAY_DUCK: background music ducks to ~30% but keeps playing
-                // EXCLUSIVE would silence everything — wrong for mimicry
-                AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
                 .setAudioAttributes(AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_ASSISTANT)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
-                .setWillPauseWhenDucked(false)   // don't pause, just duck
-                .setAcceptsDelayedFocusGain(true) // smooth transition
                 .setOnAudioFocusChangeListener {}.build()
             focusRequest = req
             manager.requestAudioFocus(req)
@@ -506,13 +490,13 @@ object HindiTtsService {
 
     private fun detectTextEmotion(t: String): Emotion {
         val l = t.lowercase()
-        if (t.contains("!!"))                                                              return Emotion.ANGRY
-        if (t.endsWith("!") || t.endsWith("！"))                                          return Emotion.SURPRISED
-        if (listOf("उदास","दुखी","sad","sorry","cry","रोना").any { l.contains(it) })   return Emotion.SAD
-        if (listOf("गुस्सा","angry","hate","damn","क्रोध").any    { l.contains(it) })   return Emotion.ANGRY
-        if (listOf("डर","afraid","scared","fearful","घबरा").any   { l.contains(it) })   return Emotion.FEARFUL
-        if (listOf("वाह","wow","खुश","happy","great","love").any  { l.contains(it) })   return Emotion.HAPPY
-        if (listOf("warm","tender","soft","प्यार","gentle").any   { l.contains(it) })   return Emotion.TENDER
+        if (t.contains("!!"))                                                             return Emotion.ANGRY
+        if (t.endsWith("!") || t.endsWith("！"))                                         return Emotion.SURPRISED
+        if (listOf("उदास","दुखी","sad","sorry","cry").any  { l.contains(it) })         return Emotion.SAD
+        if (listOf("गुस्सा","angry","hate","damn").any      { l.contains(it) })         return Emotion.ANGRY
+        if (listOf("डर","afraid","scared","fearful").any    { l.contains(it) })         return Emotion.FEARFUL
+        if (listOf("वाह","wow","खुश","happy","great").any  { l.contains(it) })         return Emotion.HAPPY
+        if (listOf("warm","tender","soft","प्यार").any      { l.contains(it) })         return Emotion.TENDER
         return Emotion.NEUTRAL
     }
 
