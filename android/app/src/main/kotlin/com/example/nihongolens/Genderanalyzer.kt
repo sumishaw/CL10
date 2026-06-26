@@ -5,7 +5,6 @@ import android.media.AudioFormat
 import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
 import android.media.projection.MediaProjection
-import android.content.Context
 import android.os.Build
 import android.util.Log
 import kotlinx.coroutines.*
@@ -31,12 +30,6 @@ import java.util.concurrent.atomic.AtomicLong
  *   emotion     — one of 23 voice types detected from the above features
  */
 object GenderAnalyzer {
-
-    private lateinit var appContext: Context
-
-    fun initialize(context: Context) {
-        appContext = context.applicationContext
-    }
 
     private const val TAG           = "GenderAnalyzer"
     private const val SR            = 16_000
@@ -105,6 +98,7 @@ object GenderAnalyzer {
     // Captured USAGE_MEDIA PCM written to a circular file on disk.
     // TTS server reads this file directly at synthesis time — zero latency.
     // File: bg_pcm.raw in app files dir — 3s circular buffer (96KB)
+    private var appContext:    android.content.Context? = null
     private var bgDucked       = false
     private var bgFile:        RandomAccessFile? = null
     private val BG_FILE_BYTES  = 16000 * 2 * 3   // 3s × 16kHz × 2 bytes/sample = 96000
@@ -112,7 +106,7 @@ object GenderAnalyzer {
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
-    fun start(projection: MediaProjection? = null) {
+    fun start(projection: MediaProjection? = null, context: android.content.Context? = null) {
         if (enabled) return
         if (projection == null) {
             lastStatus = "no projection — grant screen capture permission"
@@ -121,6 +115,7 @@ object GenderAnalyzer {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
             lastStatus = "API < Q"; return
         }
+        if (context != null) appContext = context
         stop()
         captureJob = scope.launch { captureLoop(projection) }
     }
@@ -182,13 +177,18 @@ object GenderAnalyzer {
 
         // Open circular PCM file for TTS server to read BG audio from
         try {
-            val filesDir = appContext.filesDir.absolutePath
+            // Use stored context (passed from SpeechCaptureService/MainActivity)
+            val filesDir = appContext?.filesDir?.absolutePath
+                ?: "/data/data/com.example.nihongolens/files"
             val bgPath = "$filesDir/bg_pcm.raw"
             bgFile = RandomAccessFile(bgPath, "rw")
-            bgFile?.setLength(BG_FILE_BYTES.toLong())  // pre-allocate 96KB circular buffer
-            // Write path to a companion file so server knows where to find it
+            bgFile?.setLength(BG_FILE_BYTES.toLong())
+            // Write path to world-readable location so Python server can find it
+            val tmpPath = "/data/local/tmp/bg_pcm.path"
+            try { File(tmpPath).writeText(bgPath) } catch (_: Exception) {}
+            // Also write to app files
             File("$filesDir/bg_pcm.path").writeText(bgPath)
-            CaptionLogger.log(TAG, "BG PCM file: $bgPath (${BG_FILE_BYTES/1024}KB circular)")
+            CaptionLogger.log(TAG, "BG PCM file ready: $bgPath")
         } catch (e: Exception) {
             CaptionLogger.log(TAG, "BG file init failed: ${e.message}")
             bgFile = null
@@ -450,6 +450,8 @@ object GenderAnalyzer {
 
     // ── Background audio streaming ───────────────────────────────────────────
 
+            conn.responseCode         // trigger send
+            conn.disconnect()
     // ── Background audio (Android handles mixing automatically) ──────────────
     // USAGE_MEDIA (video) and USAGE_ASSISTANT (TTS) are mixed by Android AudioManager.
     // No manual ducking needed — AudioFocus system handles volume balance.
