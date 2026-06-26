@@ -45,38 +45,6 @@ object GenderAnalyzer {
     private const val RMS_FLOOR    = 80f
     private const val HIST         = 3
 
-    // ── Emotion ───────────────────────────────────────────────────────────────
-
-    enum class Emotion {
-        // ── 7 Basic Emotions ─────────────────────────────────────────────────
-        NEUTRAL, HAPPY, SAD, ANGRY, FEARFUL, SURPRISED, DISGUST,
-        // ── Breathive & Low-Intensity ────────────────────────────────────────
-        BREATHY, WHISPERY, HUSHED, MURMURED,
-        // ── Warm & Affectionate ──────────────────────────────────────────────
-        VELVETY, SULTRY, WARM, TENDER,
-        // ── Intense & Physiological ──────────────────────────────────────────
-        HUSKY, RASPY, GRAVELLY, STRAINED,
-        // ── Rhythmic & Expressive ────────────────────────────────────────────
-        SIGHING, PANTING, MOANING, GASPING;
-
-        val speedMult: Float get() = when (this) {
-            // Basic emotions
-            HAPPY     -> 1.12f;  SAD      -> 0.85f;  ANGRY    -> 1.05f
-            FEARFUL   -> 0.95f;  SURPRISED-> 1.08f;  DISGUST  -> 0.90f
-            // Breathive — slow, intimate
-            BREATHY   -> 0.90f;  WHISPERY -> 0.85f
-            HUSHED    -> 0.88f;  MURMURED -> 0.82f
-            // Warm — slightly slower, lingering
-            VELVETY   -> 0.92f;  SULTRY   -> 0.88f
-            WARM      -> 0.95f;  TENDER   -> 0.90f
-            // Intense — some faster (strained/panting), some slower (gravelly)
-            HUSKY     -> 0.93f;  RASPY    -> 1.00f
-            GRAVELLY  -> 0.85f;  STRAINED -> 1.10f
-            // Rhythmic
-            SIGHING   -> 0.80f;  PANTING  -> 1.20f
-            MOANING   -> 0.75f;  GASPING  -> 1.15f
-            else      -> 1.00f
-        }
 
         val pitchMult: Float get() = when (this) {
             // Basic emotions
@@ -109,10 +77,10 @@ object GenderAnalyzer {
 
     @Volatile var enabled     = false
     @Volatile var lastStatus  = "waiting for screen capture permission"
-    @Volatile var detectedEmotion: Emotion = Emotion.NEUTRAL
+    @Volatile var detectedEmotion: HindiTtsService.Emotion = HindiTtsService.Emotion.NEUTRAL
 
     private val history       = ArrayDeque<HindiTtsService.Gender>()
-    private val emotionHistory = ArrayDeque<Emotion>()  // smoothed over 5 frames
+    private val emotionHistory = ArrayDeque<HindiTtsService.Emotion>()  // smoothed over 5 frames
     private val accum         = ShortArray(WIN)
     private var accumFill     = 0
 
@@ -335,103 +303,103 @@ object GenderAnalyzer {
         // Priority: Rhythmic > Intense > Breathive/Warm > Basic emotions
         // (More specific/extreme patterns detected first)
 
-        val emotion: Emotion = when {
+        val emotion: HindiTtsService.Emotion = when {
 
             // ── RHYTHMIC & EXPRESSIVE (strongest physical signals) ────────────
             // GASPING: sudden RMS spike + sharp F0 rise + high jitter
             f0Slope > 0.20f && rmsNorm > 1.5f && f0Jitter > 0.15f ->
-                Emotion.GASPING
+                HindiTtsService.Emotion.GASPING
 
             // PANTING: very high jitter + high RMS + elevated F0 (rapid bursts)
             f0Jitter > 0.18f && rmsNorm > 1.0f && f0 > f0Mean * 1.02f ->
-                Emotion.PANTING
+                HindiTtsService.Emotion.PANTING
 
             // MOANING: very low F0, sustained (low jitter), mid energy, mid HNR
             f0 < f0Mean * 0.85f && f0Jitter < 0.06f && rmsNorm in 0.3f..1.0f && hnr > 0.4f ->
-                Emotion.MOANING
+                HindiTtsService.Emotion.MOANING
 
             // SIGHING: falling F0 slope, low energy (exhalation)
             f0Slope < -0.12f && rmsNorm < 0.6f && hnr > 0.3f ->
-                Emotion.SIGHING
+                HindiTtsService.Emotion.SIGHING
 
             // ── INTENSE & PHYSIOLOGICAL ───────────────────────────────────────
             // STRAINED: high F0, high energy, high jitter, harsh
             f0 > f0Mean * 1.12f && rmsNorm > 1.3f && f0Jitter > 0.10f && hnr < 0.5f ->
-                Emotion.STRAINED
+                HindiTtsService.Emotion.STRAINED
 
             // GRAVELLY: very low F0, very low HNR (creaky), high jitter
             f0 < f0Mean * 0.80f && hnr < 0.30f && f0Jitter > 0.10f ->
-                Emotion.GRAVELLY
+                HindiTtsService.Emotion.GRAVELLY
 
             // RASPY: low HNR (gritty), high RMS, high jitter (rough texture)
             hnr < 0.35f && rmsNorm > 1.0f && f0Jitter > 0.08f ->
-                Emotion.RASPY
+                HindiTtsService.Emotion.RASPY
 
             // HUSKY: low HNR (rough), mid-high RMS, mid jitter (throat constriction)
             hnr < 0.45f && rmsNorm in 0.7f..1.5f && f0Jitter in 0.05f..0.12f ->
-                Emotion.HUSKY
+                HindiTtsService.Emotion.HUSKY
 
             // ── BASIC HIGH-ENERGY EMOTIONS ────────────────────────────────────
             // SURPRISED: sudden sharp F0 rise (>15% in one frame) + energy
             f0Slope > 0.15f && rmsNorm > 0.8f ->
-                Emotion.SURPRISED
+                HindiTtsService.Emotion.SURPRISED
 
             // ANGRY: very high energy, harsh (low HNR), any pitch
             rmsNorm > 1.4f && hnr < 0.5f ->
-                Emotion.ANGRY
+                HindiTtsService.Emotion.ANGRY
 
             // FEARFUL: high pitch, HIGH jitter (shaky), inconsistent
             f0 > f0Mean * 1.05f && f0Jitter > 0.12f ->
-                Emotion.FEARFUL
+                HindiTtsService.Emotion.FEARFUL
 
             // ── BREATHIVE & LOW-INTENSITY (low energy + low HNR) ─────────────
             // WHISPERY: very low RMS + very low HNR (unvoiced air)
             rmsNorm < 0.25f && hnr < 0.25f ->
-                Emotion.WHISPERY
+                HindiTtsService.Emotion.WHISPERY
 
             // MURMURED: low F0, low RMS, low HNR (continuous low sound)
             f0 < f0Mean * 0.88f && rmsNorm < 0.4f && hnr < 0.4f ->
-                Emotion.MURMURED
+                HindiTtsService.Emotion.MURMURED
 
             // HUSHED: low RMS, low HNR, low jitter (soft but controlled)
             rmsNorm < 0.35f && hnr < 0.40f && f0Jitter < 0.06f ->
-                Emotion.HUSHED
+                HindiTtsService.Emotion.HUSHED
 
             // BREATHY: low HNR (air leaking), low-mid RMS, steady F0
             hnr < 0.40f && rmsNorm in 0.2f..0.8f && f0Jitter < 0.07f ->
-                Emotion.BREATHY
+                HindiTtsService.Emotion.BREATHY
 
             // ── WARM & AFFECTIONATE (high HNR = clear resonant voice) ─────────
             // SULTRY: low F0, high HNR, low jitter, low-mid energy
             f0 < f0Mean * 0.92f && hnr > 0.65f && f0Jitter < 0.05f && rmsNorm < 0.9f ->
-                Emotion.SULTRY
+                HindiTtsService.Emotion.SULTRY
 
             // TENDER: low energy, high HNR, low jitter (gentle, light)
             rmsNorm < 0.45f && hnr > 0.60f && f0Jitter < 0.05f ->
-                Emotion.TENDER
+                HindiTtsService.Emotion.TENDER
 
             // VELVETY: mid-low F0, high HNR, low jitter (smooth rich)
             f0 < f0Mean * 0.97f && hnr > 0.70f && f0Jitter < 0.04f ->
-                Emotion.VELVETY
+                HindiTtsService.Emotion.VELVETY
 
             // WARM: mid F0, high HNR, low jitter, mid energy (resonant)
             hnr > 0.65f && f0Jitter < 0.05f && rmsNorm in 0.4f..1.1f ->
-                Emotion.WARM
+                HindiTtsService.Emotion.WARM
 
             // ── BASIC EMOTIONAL STATES ────────────────────────────────────────
             // HAPPY: F0 above baseline, steady, energetic, clear
             f0 > f0Mean * 1.08f && f0Jitter < 0.08f && rmsNorm > 0.6f && hnr > 0.6f ->
-                Emotion.HAPPY
+                HindiTtsService.Emotion.HAPPY
 
             // SAD: F0 below baseline, flat slope, low energy
             f0 < f0Mean * 0.93f && abs(f0Slope) < 0.05f && rmsNorm < 0.7f ->
-                Emotion.SAD
+                HindiTtsService.Emotion.SAD
 
             // DISGUST: F0 dropping, low energy, creaky
             f0Slope < -0.10f && rmsNorm < 0.9f && hnr < 0.45f ->
-                Emotion.DISGUST
+                HindiTtsService.Emotion.DISGUST
 
-            else -> Emotion.NEUTRAL
+            else -> HindiTtsService.Emotion.NEUTRAL
         }
 
         // Smooth emotion over 5 frames — prevent rapid flickering
@@ -440,7 +408,7 @@ object GenderAnalyzer {
 
         // Majority vote for smoothed emotion
         val emotionCounts = emotionHistory.groupingBy { it }.eachCount()
-        val smoothedEmotion = emotionCounts.maxByOrNull { it.value }?.key ?: Emotion.NEUTRAL
+        val smoothedEmotion: HindiTtsService.Emotion = emotionCounts.maxByOrNull { it.value }?.key ?: HindiTtsService.Emotion.NEUTRAL
 
         if (smoothedEmotion != detectedEmotion) {
             detectedEmotion = smoothedEmotion
