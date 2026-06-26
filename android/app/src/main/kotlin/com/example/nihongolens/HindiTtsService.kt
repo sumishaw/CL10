@@ -226,8 +226,13 @@ object HindiTtsService {
                         toFeminineHindi(item.text) else item.text
 
                     val wav = fetchWav(textToSpeak, resolvedGender, item.speed, item.pitch)
-                    if (wav != null) CaptionLogger.log("HindiTTS",
-                        "[${item.emotion.name}/${item.emotion.category}] spd=${String.format("%.2f",item.speed)} pch=${String.format("%.2f",item.pitch)}")
+                    if (wav != null) {
+                        val p = GenderAnalyzer.currentProfile
+                        CaptionLogger.log("HindiTTS", "[${item.emotion.name}] " +
+                            "spd=${"%.2f".format(item.speed)} pch=${"%.2f".format(item.pitch)} " +
+                            "vol=${"%.2f".format(p.volume)} breath=${"%.2f".format(p.breathiness)} " +
+                            "rough=${"%.3f".format(p.roughness)} slope=${p.pitchSlope}")
+                    }
                     if (wav != null && wav.size > 44) {
                         val sr  = readInt(wav, 24).coerceAtLeast(8_000)
                         val nch = readShort(wav, 22).coerceAtLeast(1)
@@ -278,10 +283,19 @@ object HindiTtsService {
         withContext(Dispatchers.IO) {
             var conn: HttpURLConnection? = null
             try {
-                val enc      = java.net.URLEncoder.encode(text, "UTF-8")
-                val pitchStr = String.format("%.3f", pitch)
-                conn = URL("$TTS_URL?text=$enc&gender=$gender&speed=$speed&pitch=$pitchStr")
-                    .openConnection() as HttpURLConnection
+                val enc     = java.net.URLEncoder.encode(text, "UTF-8")
+                val profile = GenderAnalyzer.currentProfile
+                // Build URL with full voice profile — server applies all as DSP
+                val url = buildString {
+                    append("$TTS_URL?text=$enc&gender=$gender")
+                    append("&speed=${String.format("%.3f", speed)}")
+                    append("&pitch=${String.format("%.3f", pitch)}")
+                    append("&volume=${String.format("%.3f", profile.volume.coerceIn(0.4f, 2.0f))}")
+                    append("&breathiness=${String.format("%.3f", profile.breathiness)}")
+                    append("&roughness=${String.format("%.3f", profile.roughness)}")
+                    append("&pitch_slope=${profile.pitchSlope}")
+                }
+                conn = URL(url).openConnection() as HttpURLConnection
                 conn.connectTimeout = 5_000
                 conn.readTimeout    = 20_000
                 if (conn.responseCode == 200) conn.inputStream.readBytes() else null
