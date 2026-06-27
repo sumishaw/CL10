@@ -309,19 +309,20 @@ class MainActivity : FlutterActivity() {
     fun onLiveCaptionReaderConnected() {
         mainHandler.post {
             methodChannel?.invokeMethod("onLiveCaptionReaderConnected", null)
-            // Start GenderAnalyzer using Visualizer API — no projection needed, safe to call anytime
             if (!GenderAnalyzer.enabled) GenderAnalyzer.start()
 
-            // FIX: Auto-enable TTS — previously required manual toggle in Flutter UI settings
-            // speak() returned immediately when enabled=false, causing zero audio output
             if (!HindiTtsService.enabled) {
                 HindiTtsService.setEnabled(true)
                 android.util.Log.d("MainActivity", "TTS auto-enabled on LC connect")
             }
 
-            // FIX: Auto-start OverlayService if it isn't already running
-            // Without this, OverlayService.instance = null → updateText() is a no-op → no subtitles
-            // The user should have overlay permission from initial setup; start automatically here
+            // FIX BUG 2: Start BackgroundMusicRecorder for BG music capture + mixing
+            // Captures USAGE_MEDIA at 44100Hz stereo → indexed chunks → mixed into TTS audio
+            if (!BackgroundMusicRecorder.enabled) {
+                BackgroundMusicRecorder.start(lcProjection)
+                android.util.Log.d("MainActivity", "BackgroundMusicRecorder started on LC connect")
+            }
+
             if (OverlayService.instance == null && Settings.canDrawOverlays(this@MainActivity)) {
                 startForegroundServiceCompat(Intent(this@MainActivity, OverlayService::class.java))
                 android.util.Log.d("MainActivity", "OverlayService auto-started on LC connect")
