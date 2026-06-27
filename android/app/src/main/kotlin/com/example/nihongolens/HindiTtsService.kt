@@ -43,48 +43,16 @@ object HindiTtsService {
     private const val GENDER_URL = "http://127.0.0.1:8765/gender"
 
     enum class Gender  { AUTO, MALE, FEMALE }
-    enum class Emotion {
-        // Basic
-        NEUTRAL, HAPPY, SAD, ANGRY, FEARFUL, SURPRISED, DISGUST,
-        // Breathive
-        BREATHY, WHISPERY, HUSHED, MURMURED,
-        // Warm
-        VELVETY, SULTRY, WARM, TENDER,
-        // Intense
-        HUSKY, RASPY, GRAVELLY, STRAINED,
-        // Rhythmic
-        SIGHING, PANTING, MOANING, GASPING,
-        // Vocal performance
-        SINGING;
+    enum class Emotion { NEUTRAL, HAPPY, SAD, ANGRY, EXCITED, CURIOUS }
 
-        // Speed multiplier — combined with user speed setting
-        val speedMult: Float get() = when (this) {
-            HAPPY->1.12f; SAD->0.85f; ANGRY->1.05f; FEARFUL->0.95f
-            SURPRISED->1.08f; DISGUST->0.90f
-            BREATHY->0.90f; WHISPERY->0.85f; HUSHED->0.88f; MURMURED->0.82f
-            VELVETY->0.92f; SULTRY->0.88f; WARM->0.95f; TENDER->0.90f
-            HUSKY->0.93f; RASPY->1.00f; GRAVELLY->0.85f; STRAINED->1.10f
-            SIGHING->0.80f; PANTING->1.20f; MOANING->0.75f; GASPING->1.15f
-            SINGING->0.88f; else->1.00f
-        }
-        val category: String get() = when(this) {
-            NEUTRAL,HAPPY,SAD,ANGRY,FEARFUL,SURPRISED,DISGUST -> "basic"
-            BREATHY,WHISPERY,HUSHED,MURMURED -> "breathive"
-            VELVETY,SULTRY,WARM,TENDER -> "warm"
-            HUSKY,RASPY,GRAVELLY,STRAINED -> "intense"
-            SIGHING,PANTING,MOANING,GASPING -> "rhythmic"
-            SINGING -> "singing"
-        }
-    }
-
-    // Set by GenderAnalyzer from acoustic analysis
-    @Volatile var currentEmotion: Emotion = Emotion.NEUTRAL
-
-    @JvmField @Volatile var enabled           = false
+    // FIX: enabled = true by default.
+    // Was false — requiring user to manually toggle in Flutter UI settings panel.
+    // speak() has guard 'if (!enabled) return' — with false default, ZERO audio ever played.
+    // Auto-enable here; user can still disable from settings if desired.
+    @JvmField @Volatile var enabled           = true
     @JvmField @Volatile var selectedGender    = Gender.AUTO
     @Volatile var ttsSpeedMultiplier          = 1.5f
     @Volatile var detectedGender              = Gender.MALE
-    @Volatile var sessionToken              = 0   // incremented on LC gone — stale translations discarded
     @Volatile var isSpeaking                  = false
     @Volatile private var speakingUntilMs     = 0L
 
@@ -94,20 +62,14 @@ object HindiTtsService {
     private var focusRequest: android.media.AudioFocusRequest? = null
 
     // ── FIFO queues (unbounded — never drop sentences) ────────────────────────
-    data class FetchItem(
-        val text: String, val gender: String, val speed: Float,
-        val srcText: String = "", val token: Int = 0,
-        val emotion: Emotion = Emotion.NEUTRAL,
-        val volume: Float = 1.0f, val pitchSlope: String = "flat",
-        val bgSeq: Int = 0
-    )
+    data class FetchItem(val text: String, val gender: String, val speed: Float, val srcText: String = "")
     data class PlayItem (val text: String, val wav: ByteArray, val durMs: Long)
 
     private val fetchQueue = LinkedBlockingQueue<FetchItem>()
     private val playQueue  = LinkedBlockingQueue<PlayItem>()
 
     // Token dedup — never re-speak same sentence
-    @JvmField val spokenTokens = java.util.concurrent.ConcurrentHashMap<Int, Long>()  // token → timestamp, 10s window
+    @JvmField val spokenTokens = java.util.concurrent.ConcurrentHashMap<Int, Boolean>()  // accessible from GenderAnalyzer
 
     private var fetchWorker: Job? = null
     private var playWorker:  Job? = null
@@ -146,13 +108,12 @@ object HindiTtsService {
     fun isSuppressed() = isSpeaking || System.currentTimeMillis() < speakingUntilMs
 
     fun stopAndClear() {
-        sessionToken++   // invalidate all in-flight translations
         fetchQueue.clear(); playQueue.clear()
         stopAudio()
         isSpeaking = false
         speakingUntilMs = System.currentTimeMillis() + 2_000L
         spokenTokens.clear()
-        Log.d(TAG, "Stopped (LC silent) token=$sessionToken")
+        Log.d(TAG, "Stopped (LC silent)")
     }
 
     fun destroy() {
@@ -169,21 +130,11 @@ object HindiTtsService {
         val n = hindi.trim().replace(Regex("\\s+"), " ")
 
         val token = n.hashCode()
-        val now = System.currentTimeMillis()
-        val lastSpoken = spokenTokens[token]
-        if (lastSpoken != null && now - lastSpoken < 10_000L) return  // same sentence within 10s → skip
-        spokenTokens[token] = now   // record when spoken
+        if (spokenTokens.putIfAbsent(token, true) != null) return
         if (spokenTokens.size > 300) spokenTokens.clear()
 
-        // Use acoustic emotion (from GenderAnalyzer) — fall back to text
-        val audioEmotion = currentEmotion
-        val textEmotion  = detectTextEmotion(n)
-        val emotion      = if (audioEmotion != Emotion.NEUTRAL) audioEmotion else textEmotion
-        val speed        = (emotion.speedMult.coerceIn(0.75f, 1.15f) * ttsSpeedMultiplier)
-                               .coerceIn(0.5f, 3.0f)
-        val profile      = GenderAnalyzer.currentProfile
-        val volume       = profile.volume.coerceIn(0.5f, 1.8f)
-        val pitchSlope   = profile.pitchSlope
+        val emotion = detectEmotion(n)
+        val speed   = (emotionSpeed(emotion) * ttsSpeedMultiplier).coerceIn(0.5f, 4.0f)
         // Always store "auto" — gender resolved at fetch time so switches apply immediately
         // even for sentences already in queue
         val genderTag = when (selectedGender) {
@@ -194,9 +145,7 @@ object HindiTtsService {
 
         // FIFO: never drop sentences — every sentence gets spoken in order
         // fetchQueue is unbounded LinkedBlockingQueue so memory is safe
-        val bgSeq = BackgroundMusicRecorder.currentSeq.get()
-        fetchQueue.offer(FetchItem(n, genderTag, speed, srcText, sessionToken,
-            emotion, volume, pitchSlope, bgSeq))
+        fetchQueue.offer(FetchItem(n, genderTag, speed, srcText))
     }
 
 
@@ -229,12 +178,7 @@ object HindiTtsService {
                     val textToSpeak = if (verbGender == "female")
                         toFeminineHindi(item.text) else item.text
 
-                    // Discard if LC went away while we were translating
-                    if (item.token != sessionToken) {
-                        CaptionLogger.log(TAG, "DISCARD stale token ${item.token}≠$sessionToken")
-                        continue
-                    }
-                    val wav = fetchWav(item.copy(text = textToSpeak), resolvedGender)
+                    val wav = fetchWav(textToSpeak, resolvedGender, item.speed)
                     if (wav != null && wav.size > 44) {
                         val sr  = readInt(wav, 24).coerceAtLeast(8_000)
                         val nch = readShort(wav, 22).coerceAtLeast(1)
@@ -281,21 +225,13 @@ object HindiTtsService {
 
     // ── HTTP fetch ────────────────────────────────────────────────────────────
 
-    private suspend fun fetchWav(item: FetchItem, resolvedGender: String): ByteArray? =
+    private suspend fun fetchWav(text: String, gender: String, speed: Float): ByteArray? =
         withContext(Dispatchers.IO) {
             var conn: HttpURLConnection? = null
             try {
-                val enc = java.net.URLEncoder.encode(item.text, "UTF-8")
-                val url = "$TTS_URL?text=$enc&gender=$resolvedGender" +
-                    "&speed=${String.format("%.3f",item.speed)}" +
-                    "&emotion=${item.emotion.name}" +
-                    "&volume=${String.format("%.3f",item.volume)}" +
-                    "&pitch_slope=${item.pitchSlope}" +
-                    "&bg_seq=${item.bgSeq}"
-                CaptionLogger.log("HindiTTS", "[${item.emotion.name}/${item.emotion.category}] " +
-                    "spd=${String.format("%.2f",item.speed)} vol=${String.format("%.2f",item.volume)} " +
-                    "slope=${item.pitchSlope} bg_seq=${item.bgSeq}")
-                conn = URL(url).openConnection() as HttpURLConnection
+                val enc = java.net.URLEncoder.encode(text, "UTF-8")
+                conn = URL("$TTS_URL?text=$enc&gender=$gender&speed=$speed")
+                    .openConnection() as HttpURLConnection
                 conn.connectTimeout = 5_000
                 conn.readTimeout    = 20_000
                 if (conn.responseCode == 200) conn.inputStream.readBytes() else null
@@ -492,19 +428,21 @@ object HindiTtsService {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    private fun detectTextEmotion(t: String): Emotion {
+    private fun detectEmotion(t: String): Emotion {
+        if (t.endsWith("!") || t.endsWith("！")) return Emotion.EXCITED
+        if (t.endsWith("?") || t.endsWith("？")) return Emotion.CURIOUS
         val l = t.lowercase()
-        if (t.contains("!!"))                                                             return Emotion.ANGRY
-        if (t.endsWith("!") || t.endsWith("！"))                                         return Emotion.SURPRISED
-        if (listOf("उदास","दुखी","sad","sorry","cry").any  { l.contains(it) })         return Emotion.SAD
-        if (listOf("गुस्सा","angry","hate","damn").any      { l.contains(it) })         return Emotion.ANGRY
-        if (listOf("डर","afraid","scared","fearful").any    { l.contains(it) })         return Emotion.FEARFUL
-        if (listOf("वाह","wow","खुश","happy","great").any  { l.contains(it) })         return Emotion.HAPPY
-        if (listOf("warm","tender","soft","प्यार").any      { l.contains(it) })         return Emotion.TENDER
+        if (listOf("दुखी","उदास","sad","sorry","cry").any { l.contains(it) }) return Emotion.SAD
+        if (listOf("गुस्सा","angry","hate","damn").any  { l.contains(it) }) return Emotion.ANGRY
+        if (listOf("वाह","wow","खुश","love","great").any { l.contains(it) }) return Emotion.HAPPY
         return Emotion.NEUTRAL
     }
 
-
+    private fun emotionSpeed(e: Emotion) = when (e) {
+        Emotion.EXCITED -> 1.10f; Emotion.HAPPY -> 1.05f
+        Emotion.CURIOUS -> 0.97f; Emotion.SAD   -> 0.88f
+        Emotion.ANGRY   -> 1.08f; else          -> 1.00f
+    }
 
     private fun readInt(b: ByteArray, o: Int) =
         ((b[o+3].toInt() and 0xFF) shl 24) or ((b[o+2].toInt() and 0xFF) shl 16) or
