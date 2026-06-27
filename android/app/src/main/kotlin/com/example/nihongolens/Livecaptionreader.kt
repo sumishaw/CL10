@@ -516,10 +516,26 @@ class LiveCaptionReader : AccessibilityService() {
         SpeechCaptureService.latestHindi   = hindi
         SpeechCaptureService.latestEnglish = text
 
+        // FIFO TOKEN FIX:
+        // Previously: OverlayService.updateText() was called immediately when translation
+        // arrived → subtitle refreshed every 1-2s regardless of TTS state → subtitles
+        // flashed too fast, TTS was always playing an old sentence.
+        //
+        // Now: subtitle display is driven EXCLUSIVELY by HindiTtsService play worker.
+        // Flow: speak() → fetchQueue → synthesize → playQueue → PLAY → showTtsText()
+        // The subtitle only appears when TTS is about to speak it (right before playWav).
+        // When TTS finishes, clearTtsText() is called → subtitle hidden briefly.
+        // Next sentence in playQueue → showTtsText() → subtitle updates.
+        //
+        // This creates perfect audio+subtitle sync with FIFO ordering.
+        // The only direct overlay call is clearing on LC gone (line ~210).
+
+        // Send to Flutter UI counter (does NOT touch overlay)
         scope.launch(Dispatchers.Main) {
-            OverlayService.updateText(text, hindi)
             MainActivity.instance?.onTranslation(text, hindi, hindi)
         }
+
+        // Queue for TTS — play worker controls overlay display
         HindiTtsService.speak(hindi, text)
     }
 
