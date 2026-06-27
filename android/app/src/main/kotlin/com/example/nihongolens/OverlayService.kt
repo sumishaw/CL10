@@ -40,7 +40,12 @@ class OverlayService : Service() {
         const val CHANNEL_ID = "nihongo_overlay"
         const val NOTIF_ID   = 1
 
-        @Volatile @JvmField var holdMs: Long = 6_000L
+        // FIX: Default to Live mode (holdMs=0) — shows each subtitle immediately,
+        // replaced by the next one as it arrives. This matches real-time subtitle behavior.
+        // Old default was 6000ms — subtitles held 6s each, causing a backlog and
+        // appearing "stuck" while translations kept arriving faster than display advanced.
+        // User can change speed from Flutter UI settings if they prefer slower pacing.
+        @Volatile @JvmField var holdMs: Long = 0L
 
         @Volatile var latestOriginal = ""
         @Volatile var latestHindi    = ""
