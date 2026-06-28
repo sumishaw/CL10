@@ -209,7 +209,7 @@ object HindiTtsService {
     }
 
     fun destroy() {
-        fetchWorker?.cancel(); fetchWorker2?.cancel(); playWorker?.cancel()
+        fetchWorker?.cancel(); playWorker?.cancel()
         fetchQueue.clear(); playQueue.clear()
         stopAudio()
         tts?.stop(); tts?.shutdown(); tts = null
@@ -261,13 +261,11 @@ object HindiTtsService {
 
     // ── Fetch worker: Android TTS → WAV file ──────────────────────────────────
 
-    private var fetchWorker2: Job? = null   // second fetch worker for parallel pre-synthesis
-
     private fun startFetchWorker() {
-        // TWO parallel fetch workers: while F1 synthesizes sentence N,
-        // F2 starts synthesizing sentence N+1 → near-zero gap between sentences.
-        fetchWorker  = scope.launch { fetchLoop("F1") }
-        fetchWorker2 = scope.launch { fetchLoop("F2") }
+        // Single fetch worker — synthesizeMutex makes dual workers pointless:
+        // W2 would just wait 4-8s for W1 to finish then synthesize itself = no benefit.
+        // With single worker: clear FIFO order, no mutex contention, no 12s waits.
+        fetchWorker = scope.launch { fetchLoop("F1") }
     }
 
     private suspend fun fetchLoop(workerName: String) {
@@ -438,10 +436,10 @@ object HindiTtsService {
                 }
 
                 // Wait for synthesis to complete (max 8s)
-                withTimeoutOrNull(8_000L) { deferred.await() }
+                withTimeoutOrNull(12_000L) { deferred.await() }
                     ?: run {
                         pendingUtterances.remove(id)
-                        CaptionLogger.log(TAG, "TTS-TIMEOUT 8s")
+                        CaptionLogger.log(TAG, "TTS-TIMEOUT 12s")
                         return@withContext null
                     }
 
