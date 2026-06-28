@@ -31,7 +31,15 @@ object GenderAnalyzer {
     private const val F0_FEMALE    = 165f        // Hz — above = female
     private const val YIN_THRESH   = 0.25f       // stricter threshold for clean internal audio
     private const val RMS_FLOOR    = 80f         // out of 32768 — skip silence
-    private const val HIST         = 3           // 2/3 majority to switch
+
+    // STABILITY FIX: Increased from 3 → 12 frames (was switching on 2/3 frames = ~256ms)
+    // Now needs 8/12 consecutive frames to switch = ~768ms of sustained pitch change
+    // Prevents rapid MALE↔FEMALE oscillation that caused spokenTokens.clear() spam → skipped sentences
+    private const val HIST         = 12          // ~768ms majority window (was 3 = ~192ms)
+
+    // Minimum milliseconds between gender switches — prevents double-switching within one sentence
+    // Even with HIST=12, rapid pitch variation (music, noise) can still flip quickly
+    private const val MIN_SWITCH_INTERVAL_MS = 3_000L  // at most one switch per 3 seconds
 
     @Volatile var enabled    = false
     @Volatile var lastStatus = "waiting for screen capture permission"
@@ -47,6 +55,7 @@ object GenderAnalyzer {
 
     private var frameCount   = 0
     private var analyzeCount = 0
+    private var lastSwitchMs = 0L   // timestamp of last gender switch for rate limiting
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -256,12 +265,17 @@ object GenderAnalyzer {
         if (history.size > HIST) history.removeFirst()
 
         val fCount = history.count { it == HindiTtsService.Gender.FEMALE }
-        val maj    = if (fCount > history.size / 2) HindiTtsService.Gender.FEMALE
-                     else                            HindiTtsService.Gender.MALE
+        val maj    = if (fCount > history.size * 2 / 3) HindiTtsService.Gender.FEMALE
+                     else if (fCount < history.size / 3)   HindiTtsService.Gender.MALE
+                     else                                   HindiTtsService.detectedGender // no majority → keep current
 
-        if (maj != HindiTtsService.detectedGender) {
+        val nowMs = System.currentTimeMillis()
+        if (maj != HindiTtsService.detectedGender &&
+            nowMs - lastSwitchMs >= MIN_SWITCH_INTERVAL_MS) {
+            lastSwitchMs = nowMs
             HindiTtsService.detectedGender = maj
-            HindiTtsService.spokenTokens.clear()
+            // Don't clear spokenTokens on switch — sentences in flight stay valid
+            // Only clear if user explicitly wants re-speak (e.g. via stopAndClear)
             lastStatus = "MEDIA audio → $maj (F0=${f0.toInt()}Hz)"
             CaptionLogger.log(TAG, ">>> Gender SWITCHED to $maj F0=${f0.toInt()}Hz <<<")
             Log.d(TAG, "Gender→$maj F0=${f0.toInt()} rms=${rms.toInt()}")
@@ -307,44 +321,54 @@ object GenderAnalyzer {
         rising: Int, falling: Int, highEnergy: Int,
         sustainedHigh: Int, currentF0: Float
     ): HindiTtsService.Emotion {
-        val f0Mean   = f0s.average().toFloat()
-        val f0Std    = f0s.map { (it - f0Mean) * (it - f0Mean) }.average().let { Math.sqrt(it).toFloat() }
-        val rmsMean  = rmss.average().toFloat()
-        val rmsStd   = rmss.map { (it - rmsStd(rmss)) * (it - rmsStd(rmss)) }.average().let { Math.sqrt(it).toFloat() }
+        if (f0s.isEmpty() || rmss.isEmpty()) return HindiTtsService.Emotion.NEUTRAL
 
-        // Singing: sustained high F0 (>250Hz) for 5+ frames
+        val f0Mean  = f0s.average().toFloat()
+        val f0Std   = f0s.map { (it - f0Mean) * (it - f0Mean) }.average()
+                          .let { Math.sqrt(it).toFloat() }
+        val rmsMean = rmss.average().toFloat()
+        // FIX: rmsStd was calling itself recursively and returning mean not std
+        val rmsMeanVal = rmsMean
+        val rmsStdVal  = rmss.map { (it - rmsMeanVal) * (it - rmsMeanVal) }.average()
+                             .let { Math.sqrt(it).toFloat() }
+
+        // Singing: sustained high F0 (>250Hz), stable pitch (low std)
         if (sustainedHigh >= 5 && f0Std < 30f) return HindiTtsService.Emotion.SINGING
 
-        // Excited/happy: rising F0, high energy, fast
-        if (rising >= 5 && highEnergy >= 3 && f0Mean > 200f)
+        // Excited: rising pitch + high energy
+        if (rising >= 4 && highEnergy >= 3 && f0Mean > 190f)
             return HindiTtsService.Emotion.EXCITED
-        if (rising >= 4 && f0Mean > 180f)
+
+        // Happy: rising pitch, moderate energy
+        if (rising >= 3 && f0Mean > 170f && highEnergy >= 1)
             return HindiTtsService.Emotion.HAPPY
 
-        // Surprised: sudden high F0 spike
-        if (currentF0 > 280f && f0Std > 40f)
+        // Surprised: sudden high F0 spike with high variation
+        if (currentF0 > 260f && f0Std > 35f)
             return HindiTtsService.Emotion.SURPRISED
 
-        // Fearful: high F0, fast variation, moderate energy
-        if (f0Mean > 220f && f0Std > 30f && highEnergy < 3)
+        // Fearful: high variable pitch, not high energy
+        if (f0Mean > 210f && f0Std > 25f && highEnergy < 3)
             return HindiTtsService.Emotion.FEARFUL
 
-        // Angry: high energy, falling or variable pitch
-        if (highEnergy >= 5 && f0Std > 25f)
+        // Angry: high energy + variable pitch
+        if (highEnergy >= 4 && f0Std > 20f && rmsMean > 1500f)
             return HindiTtsService.Emotion.ANGRY
 
-        // Sad/sighing: falling F0, low energy, slow
-        if (falling >= 6 && rmsMean < 800f)
+        // Sighing: falling pitch, low energy
+        if (falling >= 5 && rmsMean < 1000f)
             return HindiTtsService.Emotion.SIGHING
-        if (falling >= 4 && f0Mean < 130f)
+
+        // Sad: falling pitch, low F0 overall
+        if (falling >= 3 && f0Mean < 140f && rmsMean < 1200f)
             return HindiTtsService.Emotion.SAD
 
-        // Warm: smooth stable mid F0, calm energy
-        if (f0Std < 15f && f0Mean in 120f..180f && highEnergy < 2)
+        // Warm: stable smooth mid F0, calm
+        if (f0Std < 20f && f0Mean in 110f..185f && highEnergy < 2)
             return HindiTtsService.Emotion.WARM
 
-        // Whispery: very low RMS
-        if (rmsMean < 300f && f0Std < 20f)
+        // Whispery: very low RMS (quiet speech)
+        if (rmsMean < 400f && f0Std < 25f)
             return HindiTtsService.Emotion.WHISPERY
 
         return HindiTtsService.Emotion.NEUTRAL
