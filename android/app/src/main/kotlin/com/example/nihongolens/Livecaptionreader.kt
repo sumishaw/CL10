@@ -34,7 +34,7 @@ class LiveCaptionReader : AccessibilityService() {
         private const val STARTUP_GRACE_MS = 1_000L
         private const val LANG_CONFIRM     = 3
         private const val QUEUE_CAP        = 3
-        private const val STALE_MS         = 8_000L   // raised: sentence may take 2-4s to complete
+        private const val STALE_MS         = 5_000L   // drop sentences speaker said >5s ago
 
         // ── SENTENCE COMPLETION SILENCE GAP ──────────────────────────────────
         // How long LC must be SILENT (no new text) before we treat current buffer as complete sentence.
@@ -146,13 +146,12 @@ class LiveCaptionReader : AccessibilityService() {
     private var watchdogJob:  Job? = null
 
     // FIFO + tokens
-    // speculative=true: translation started early (mid-sentence) for pipeline latency reduction
-    // If sentence grows more words before CT2 finishes, the result is used as cache warmup only
-    private data class QItem(val seq: Long, val text: String, 
-        val enqMs: Long = System.currentTimeMillis(),
-        val speculative: Boolean = false)
+    private data class QItem(val seq: Long, val text: String, val enqMs: Long = System.currentTimeMillis())
     private val queue      = LinkedBlockingQueue<QItem>()
     private val seqCounter = AtomicLong(0)
+    // Tracks which texts are currently being translated — prevents W1 and W2 both
+    // translating the same sentence simultaneously (was causing 10+ CT2 TIMEOUT cascade)
+    private val activeTranslations = mutableSetOf<String>()
     @Volatile private var expectedSeq = 0L
 
     // Translation LRU cache — avoid re-translating same sentence
@@ -520,22 +519,6 @@ class LiveCaptionReader : AccessibilityService() {
                 }
             }
         }
-
-        // SPECULATIVE TRANSLATION: start CT2 early (mid-sentence) to hide latency.
-        // When 8+ untranslated words accumulate, submit to CT2 immediately (speculative=true).
-        // CT2 takes 1-4s; by the time the sentence ends + silence fires, translation is cached.
-        // If sentence grows further, the speculative result is discarded (wrong ending) but
-        // CT2 has been "warmed up" and the retry is faster.
-        if (newWords >= 8 && wordsSinceSubmit >= 8 &&
-            System.currentTimeMillis() - lastSubmitMs >= 1_500L) {
-            val speculativeText = untranslated.trim()
-            if (speculativeText.isNotBlank() && speculativeText != lastEnqueuedText) {
-                CaptionLogger.log(TAG, "SPECULATIVE wc=$newWords pre-translating")
-                val speculativeSeq = seqCounter.incrementAndGet()
-                queue.offer(QItem(speculativeSeq, speculativeText,
-                    System.currentTimeMillis(), speculative = true))
-            }
-        }
     }
 
     private fun doSubmit(text: String, currentTotalWords: Int) {
@@ -554,6 +537,15 @@ class LiveCaptionReader : AccessibilityService() {
         if (devanagariCount > 0) {
             CaptionLogger.log(TAG, "SKIP: Devanagari detected (TTS loop guard)")
             return
+        }
+
+        // HARD QUEUE CAP: If queue already has QUEUE_CAP items, drop ALL existing items
+        // and only keep the newest (current) text. This prevents CT2 from being asked to
+        // translate 10+ stale sentences — the speaker has moved on.
+        val currentSize = queue.size
+        if (currentSize >= QUEUE_CAP) {
+            queue.clear()
+            CaptionLogger.log(TAG, "QUEUE-FLUSH: had $currentSize items, keeping only latest")
         }
 
         val wordCount = text.trim().split(Regex("\\s+")).size
@@ -649,7 +641,33 @@ class LiveCaptionReader : AccessibilityService() {
 
             val t0     = System.currentTimeMillis()
             lastSentText = text
+
+            // Dedup: if the same text is already being translated by another worker,
+            // skip this item — the other worker's result will be cached and reused.
+            // Prevents W1 and W2 both spending 5s on the same sentence.
+            val alreadyRunning = synchronized(activeTranslations) {
+                if (activeTranslations.contains(nText)) true
+                else { activeTranslations.add(nText); false }
+            }
+            if (alreadyRunning) {
+                CaptionLogger.log(TAG, "DEDUP[$name] $seq already translating same text")
+                // Wait for cache to be populated by the other worker
+                var waited = 0
+                while (waited < 6000) {
+                    delay(100); waited += 100
+                    val cached2 = synchronized(translationCache) { translationCache[nText] }
+                    if (cached2 != null) {
+                        CaptionLogger.log(TAG, "DEDUP-HIT[$name] $seq got cached result")
+                        deliverHindi(seq, text, cached2, name, waited.toLong())
+                        break
+                    }
+                }
+                synchronized(activeTranslations) { activeTranslations.remove(nText) }
+                continue
+            }
+
             val result = callServer(text)
+            synchronized(activeTranslations) { activeTranslations.remove(nText) }
             val ms     = System.currentTimeMillis() - t0
 
             // CRITICAL FIX: With 6s timeout, if it still takes >4s the sentence is too old
@@ -676,13 +694,7 @@ class LiveCaptionReader : AccessibilityService() {
                 translationCache[nText] = hindi
             }
 
-            if (item.speculative) {
-                // Speculative result: cache it for immediate use when sentence ends.
-                // Do NOT deliver to TTS yet — sentence may still be growing.
-                CaptionLogger.log(TAG, "SPEC-CACHED[$name] $seq ${ms}ms '${hindi.take(30)}'")
-            } else {
-                deliverHindi(seq, text, hindi, name, ms)
-            }
+            deliverHindi(seq, text, hindi, name, ms)
         }
     }
 
