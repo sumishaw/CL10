@@ -146,7 +146,11 @@ class LiveCaptionReader : AccessibilityService() {
     private var watchdogJob:  Job? = null
 
     // FIFO + tokens
-    private data class QItem(val seq: Long, val text: String, val enqMs: Long = System.currentTimeMillis())
+    // speculative=true: translation started early (mid-sentence) for pipeline latency reduction
+    // If sentence grows more words before CT2 finishes, the result is used as cache warmup only
+    private data class QItem(val seq: Long, val text: String, 
+        val enqMs: Long = System.currentTimeMillis(),
+        val speculative: Boolean = false)
     private val queue      = LinkedBlockingQueue<QItem>()
     private val seqCounter = AtomicLong(0)
     @Volatile private var expectedSeq = 0L
@@ -516,6 +520,22 @@ class LiveCaptionReader : AccessibilityService() {
                 }
             }
         }
+
+        // SPECULATIVE TRANSLATION: start CT2 early (mid-sentence) to hide latency.
+        // When 8+ untranslated words accumulate, submit to CT2 immediately (speculative=true).
+        // CT2 takes 1-4s; by the time the sentence ends + silence fires, translation is cached.
+        // If sentence grows further, the speculative result is discarded (wrong ending) but
+        // CT2 has been "warmed up" and the retry is faster.
+        if (newWords >= 8 && wordsSinceSubmit >= 8 &&
+            System.currentTimeMillis() - lastSubmitMs >= 1_500L) {
+            val speculativeText = untranslated.trim()
+            if (speculativeText.isNotBlank() && speculativeText != lastEnqueuedText) {
+                CaptionLogger.log(TAG, "SPECULATIVE wc=$newWords pre-translating")
+                val speculativeSeq = seqCounter.incrementAndGet()
+                queue.offer(QItem(speculativeSeq, speculativeText,
+                    System.currentTimeMillis(), speculative = true))
+            }
+        }
     }
 
     private fun doSubmit(text: String, currentTotalWords: Int) {
@@ -656,7 +676,13 @@ class LiveCaptionReader : AccessibilityService() {
                 translationCache[nText] = hindi
             }
 
-            deliverHindi(seq, text, hindi, name, ms)
+            if (item.speculative) {
+                // Speculative result: cache it for immediate use when sentence ends.
+                // Do NOT deliver to TTS yet — sentence may still be growing.
+                CaptionLogger.log(TAG, "SPEC-CACHED[$name] $seq ${ms}ms '${hindi.take(30)}'")
+            } else {
+                deliverHindi(seq, text, hindi, name, ms)
+            }
         }
     }
 
