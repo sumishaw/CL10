@@ -192,12 +192,7 @@ class MainActivity : FlutterActivity() {
                 "downloadLogs" -> result.success(CaptionLogger.downloadLogs(this))
                 "clearLogs"    -> { CaptionLogger.clearLines(); result.success(null) }
 
-                "clearLogs" -> {
-                    CaptionLogger.clearLines()
-                    result.success(null)
-                }
-
-                "getGenderStatus" -> {
+                                "getGenderStatus" -> {
                     result.success(mapOf(
                         "detected"  to if (HindiTtsService.detectedGender == HindiTtsService.Gender.FEMALE) "female" else "male",
                         "selected"  to when (HindiTtsService.selectedGender) {
