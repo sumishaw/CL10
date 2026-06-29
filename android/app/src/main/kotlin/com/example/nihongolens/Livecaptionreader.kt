@@ -34,7 +34,7 @@ class LiveCaptionReader : AccessibilityService() {
         private const val STARTUP_GRACE_MS = 1_000L
         private const val LANG_CONFIRM     = 3
         private const val QUEUE_CAP        = 3
-        private const val STALE_MS         = 6_000L   // 12-word chunk: 1.2s translate + 4.8s margin
+        private const val STALE_MS         = 5_000L   // 10-word chunk: 0.8s translate + margin: 1.2s translate + 4.8s margin
 
         // ── SENTENCE COMPLETION SILENCE GAP ──────────────────────────────────
         // How long LC must be SILENT (no new text) before we treat current buffer as complete sentence.
@@ -122,18 +122,18 @@ class LiveCaptionReader : AccessibilityService() {
         // FORCE every 6 words = 10 submissions of the same sentence → CT2 flood.
         // Match server chunk size: 12 words per CT2 call → ~1.2s per chunk
         // Previously 20 words → 2.5s per chunk → 5-chunk paragraph = 12.5s backlog
-        private const val MAX_WORDS_BEFORE_FORCE = 12
+        private const val MAX_WORDS_BEFORE_FORCE = 10  // match 10-word server chunk
 
         // FORCE_MIN_NEW_WORDS: raised 6→12. Previously wordsSinceSubmit=7 bypassed
         // cooldown, causing same text to be submitted every 7 words (3s = 1+ per second).
         // After FORCE, need 6 new words before next FORCE (was 12)
         // With 12-word chunks: 6 new words = speaker said half a chunk = safe to re-submit
-        private const val FORCE_MIN_NEW_WORDS = 6
+        private const val FORCE_MIN_NEW_WORDS = 5   // half of 10-word chunk
 
         // FORCE_COOLDOWN_MS: hard time-based lock after any FORCE submission.
         // Even if 12 new words arrive in 1 second, don't force-submit again.
         // 3s cooldown: 12-word chunk takes ~1.2s to translate → 3s gives 2.5× margin
-        private const val FORCE_COOLDOWN_MS  = 3_000L
+        private const val FORCE_COOLDOWN_MS  = 2_500L  // 0.8s translate + 1.7s margin
 
         private val LC_PACKAGES = setOf(
             "com.google.android.as",
