@@ -189,6 +189,7 @@ class LiveCaptionReader : AccessibilityService() {
     private var lastEnqueuedSents     = mutableSetOf<String>()
     private var lcVisible             = false
     private var lcGoneMs              = 0L   // timestamp when LC first disappeared
+    private var afterMusicGap         = false // true = just resumed after music/silence gap
     private var startupTime           = 0L
 
     // Stats
@@ -788,14 +789,19 @@ class LiveCaptionReader : AccessibilityService() {
         // Previously: subtitle waited for audio → 1s blank screen pause every sentence.
         // Now: subtitle at t=0ms, audio at t=200ms → always in sync, no blank gaps.
 
+        // Music markers: show subtitle only, don't speak
+        val isMusicMarker = hindi.contains('♪') || hindi == "👏 तालियाँ" || hindi == "😄 हँसी"
+
         scope.launch(Dispatchers.Main) {
             OverlayService.updateText(text, hindi)
             OverlayService.showTtsText(hindi)
             MainActivity.instance?.onTranslation(text, hindi, hindi)
         }
 
-        // Audio plays independently — does NOT control subtitle anymore
-        HindiTtsService.speak(hindi, text)
+        if (!isMusicMarker) {
+            // Audio plays independently — does NOT control subtitle anymore
+            HindiTtsService.speak(hindi, text)
+        }
     }
 
 
