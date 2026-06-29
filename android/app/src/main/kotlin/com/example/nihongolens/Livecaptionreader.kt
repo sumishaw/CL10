@@ -34,8 +34,8 @@ class LiveCaptionReader : AccessibilityService() {
         private const val WATCHDOG_MS      = 2_000L
         private const val STARTUP_GRACE_MS = 1_000L
         private const val LANG_CONFIRM     = 3
-        private const val QUEUE_CAP        = 3
-        private const val STALE_MS         = 5_000L   // 10-word chunk: 0.8s translate + margin: 1.2s translate + 4.8s margin
+        private const val QUEUE_CAP        = 500  // never flush while running — FIFO backlog
+        private const val STALE_MS         = Long.MAX_VALUE  // backlogs NEVER expire while running
 
         // ── SENTENCE COMPLETION SILENCE GAP ──────────────────────────────────
         // How long LC must be SILENT (no new text) before we treat current buffer as complete sentence.
@@ -114,7 +114,7 @@ class LiveCaptionReader : AccessibilityService() {
         )
 
         // ── MINIMUM WORDS FOR TRANSLATION ────────────────────────────────────
-        private const val MIN_WORDS_HARD    = 2   // after hard punctuation (lowered: "Do you?" = 2 words, must translate)
+        private const val MIN_WORDS_HARD    = 1   // FIX: numbers/single words must translate   // after hard punctuation (lowered: "Do you?" = 2 words, must translate)
         private const val MIN_WORDS_SOFT    = 7   // after soft punctuation
         private const val MIN_WORDS_SILENCE = 7   // avoid tiny fragments < 7 words
 
@@ -576,8 +576,8 @@ class LiveCaptionReader : AccessibilityService() {
         // translate 10+ stale sentences — the speaker has moved on.
         val currentSize = queue.size
         if (currentSize >= QUEUE_CAP) {
-            queue.clear()
-            CaptionLogger.log(TAG, "QUEUE-FLUSH: had $currentSize items, keeping only latest")
+            // FIFO: don't flush — log backlog size only
+            CaptionLogger.log(TAG, "QUEUE-BACKLOG: $currentSize items pending — all will be spoken")
         }
 
         val wordCount = text.trim().split(Regex("\\s+")).size
@@ -672,10 +672,8 @@ class LiveCaptionReader : AccessibilityService() {
 
             if (seq < expectedSeq) { CaptionLogger.log(TAG, "STALE $seq"); continue }
             // CRITICAL FIX: Drop sentences >5s old (was 15s)
-            if (ageMs > STALE_MS) {
-                CaptionLogger.log(TAG, "EXPIRED $seq age=${ageMs/1000}s")
-                continue
-            }
+            // FIFO: no expiry — every sentence translates, even if delayed
+            // Backlog only clears when Caption Lens is explicitly stopped
 
             // CRITICAL FIX: Check cache FIRST before any HTTP call
             val nText = norm(text)
