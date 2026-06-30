@@ -91,6 +91,10 @@ object GenderAnalyzer {
         captureRec = null
         history.clear()
         accumFill = 0
+        voiceTypeF0History.clear()
+        voiceTypeFrameCount = 0
+        HindiTtsService.currentVoiceType = HindiTtsService.VoiceType.UNKNOWN
+        HindiTtsService.currentMeasuredF0 = 0f
         if (lastStatus != "waiting for screen capture permission")
             CaptionLogger.log(TAG, "stopped")
     }
@@ -253,6 +257,15 @@ object GenderAnalyzer {
     private var sustainedHighF0Frames = 0
     private var emotionFrameCount = 0
 
+    // ── Voice Type classification state ──────────────────────────────────────
+    // Wider rolling window than emotion detection (5s vs 640ms) — voice type is
+    // a STABLE characteristic of the speaker, not a moment-to-moment emotional cue.
+    // Classified separately per gender so a switch to a new speaker re-classifies cleanly.
+    private val voiceTypeF0History = ArrayDeque<Float>(40)  // ~5s at 8 samples/sec (frame%5==0 sampling)
+    private var voiceTypeFrameCount = 0
+    private var lastVoiceTypeSwitchMs = 0L
+    private const val VOICE_TYPE_MIN_SWITCH_MS = 4_000L  // stable — don't flip-flop on noise
+
     private fun onPitch(f0: Float, rms: Float) {
         frameCount++
         val gender = if (f0 >= F0_FEMALE) HindiTtsService.Gender.FEMALE
@@ -279,6 +292,43 @@ object GenderAnalyzer {
             lastStatus = "MEDIA audio → $maj (F0=${f0.toInt()}Hz)"
             CaptionLogger.log(TAG, ">>> Gender SWITCHED to $maj F0=${f0.toInt()}Hz <<<")
             Log.d(TAG, "Gender→$maj F0=${f0.toInt()} rms=${rms.toInt()}")
+            // New speaker detected (gender flip) — reset voice type window so we
+            // don't blend the old speaker's pitch average into the new one.
+            voiceTypeF0History.clear()
+            HindiTtsService.currentMeasuredF0 = 0f
+        }
+
+        // ── Voice Type classification ─────────────────────────────────────────
+        // Wider rolling window (~5s) of F0 samples → classify into one of 6
+        // standard voice types (Soprano/Mezzo/Contralto/Countertenor/Tenor/
+        // Baritone/Bass) based on the SPEAKER'S average speaking pitch.
+        // Updates at most once per 4s to stay stable (a voice type shouldn't
+        // flicker the way emotion or even gender can).
+        voiceTypeF0History.addLast(f0)
+        if (voiceTypeF0History.size > 40) voiceTypeF0History.removeFirst()
+        voiceTypeFrameCount++
+
+        // EXACT MIRRORING: update the continuous measured F0 every cycle (not
+        // gated by the 4s stability window above) — this is what HindiTtsService
+        // actually uses for pitch calculation. The rolling average smooths out
+        // frame noise while still tracking the speaker's real pitch closely.
+        if (voiceTypeF0History.size >= 8) {
+            HindiTtsService.currentMeasuredF0 = voiceTypeF0History.average().toFloat()
+        }
+
+        if (voiceTypeFrameCount >= 20 && voiceTypeF0History.size >= 15) {
+            voiceTypeFrameCount = 0
+            val avgF0 = voiceTypeF0History.average().toFloat()
+            val classified = classifyVoiceType(avgF0, maj)
+            if (classified != HindiTtsService.currentVoiceType &&
+                nowMs - lastVoiceTypeSwitchMs >= VOICE_TYPE_MIN_SWITCH_MS) {
+                lastVoiceTypeSwitchMs = nowMs
+                HindiTtsService.currentVoiceType = classified
+                val isFemaleNow = maj == HindiTtsService.Gender.FEMALE
+                val exactRatio = HindiTtsService.exactPitchRatio(avgF0, isFemaleNow)
+                CaptionLogger.log(TAG, "VOICE-TYPE → $classified avgF0=${avgF0.toInt()}Hz " +
+                    "exactPitchRatio=${String.format("%.2f", exactRatio)}")
+            }
         }
 
         // ── FIX BUG 3: Emotion detection from acoustic features ──────────────
@@ -313,6 +363,34 @@ object GenderAnalyzer {
                 CaptionLogger.log(TAG, "EMO→$detectedEmotion F0=${f0.toInt()} slope=${f0Slope.toInt()}")
             }
             risingFrames = 0; fallingFrames = 0; highEnergyFrames = 0
+        }
+    }
+
+    // ── Voice Type Classifier ────────────────────────────────────────────────
+    // Maps average SPEAKING F0 (not singing range) to one of 6 standard voice
+    // types, gated by the already-detected gender (avoids classifying a male
+    // bass voice as a female contralto just because ranges can theoretically
+    // overlap at the boundary).
+    //
+    // Speaking F0 reference (much narrower than full singing range — people
+    // speak in the bottom third of their total vocal range, in modal/chest voice):
+    //   Female: Soprano ~220-320Hz | Mezzo ~180-220Hz | Contralto ~140-180Hz
+    //   Male:   Countertenor ~140-180Hz (rare, falsetto-adjacent)
+    //           Tenor ~120-140Hz | Baritone ~90-120Hz | Bass ~65-90Hz
+    private fun classifyVoiceType(avgF0: Float, gender: HindiTtsService.Gender): HindiTtsService.VoiceType {
+        return if (gender == HindiTtsService.Gender.FEMALE) {
+            when {
+                avgF0 >= 220f -> HindiTtsService.VoiceType.SOPRANO
+                avgF0 >= 180f -> HindiTtsService.VoiceType.MEZZO_SOPRANO
+                else          -> HindiTtsService.VoiceType.CONTRALTO
+            }
+        } else {
+            when {
+                avgF0 >= 140f -> HindiTtsService.VoiceType.COUNTERTENOR  // rare high male
+                avgF0 >= 120f -> HindiTtsService.VoiceType.TENOR
+                avgF0 >= 90f  -> HindiTtsService.VoiceType.BARITONE
+                else          -> HindiTtsService.VoiceType.BASS
+            }
         }
     }
 
