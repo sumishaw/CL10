@@ -417,8 +417,9 @@ object GenderAnalyzer {
         if (rising >= 4 && highEnergy >= 3 && f0Mean > 190f)
             return HindiTtsService.Emotion.EXCITED
 
-        // Happy: rising pitch, moderate energy
-        if (rising >= 3 && f0Mean > 170f && highEnergy >= 1)
+        // Happy: rising pitch, moderate energy (loosened: was rising>=3, f0Mean>170 — too strict
+        // for normal upbeat speech that doesn't reach excited-level highs)
+        if (rising >= 2 && f0Mean > 150f && highEnergy >= 1)
             return HindiTtsService.Emotion.HAPPY
 
         // Surprised: sudden high F0 spike with high variation
@@ -441,8 +442,10 @@ object GenderAnalyzer {
         if (falling >= 3 && f0Mean < 140f && rmsMean < 1200f)
             return HindiTtsService.Emotion.SAD
 
-        // Warm: stable smooth mid F0, calm
-        if (f0Std < 20f && f0Mean in 110f..185f && highEnergy < 2)
+        // Warm: stable smooth mid F0, calm (loosened: was f0Std<20, narrow 110-185Hz band
+        // — widened so normal calm/engaged conversational speech qualifies more often
+        // instead of defaulting to flat NEUTRAL)
+        if (f0Std < 28f && f0Mean in 95f..210f && highEnergy < 3)
             return HindiTtsService.Emotion.WARM
 
         // Whispery: very low RMS (quiet speech)
