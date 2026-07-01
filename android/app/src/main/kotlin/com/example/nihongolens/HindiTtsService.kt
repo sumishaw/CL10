@@ -1,7 +1,7 @@
-
 package com.example.nihongolens
 
 import android.content.Context
+import android.content.Intent
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
@@ -13,6 +13,9 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.LinkedBlockingQueue
@@ -336,18 +339,77 @@ object HindiTtsService {
             am?.allowedCapturePolicy = AudioAttributes.ALLOW_CAPTURE_BY_NONE
         }
 
-        // Initialize Android TTS — discover hi-IN voices and select Voice II (female) / Voice IV (male)
-        tts = TextToSpeech(context) { status ->
-            if (status == TextToSpeech.SUCCESS) {
+        // Prefer a local neural TTS engine (VoxSherpa / SherpaTTS, which
+        // expose Piper voices through the standard Android TTS interface)
+        // over the system default (Google TTS). Reason: Google's engine has
+        // internal content moderation that can silently mute certain words
+        // regardless of what text it's given (see PROFANITY-RESPELL /
+        // SPLIT-SYNTHESIS fallbacks below) — a small local engine has no such
+        // filter at all. If no such engine is installed, falls back to the
+        // system default exactly as before.
+        val enginePackage = pickPreferredEnginePackage(context)
+        CaptionLogger.log(TAG, "TTS engine selected: ${enginePackage ?: "system default"}")
+
+        tts = if (enginePackage != null) {
+            TextToSpeech(context, { status -> onTtsInit(status) }, enginePackage)
+        } else {
+            TextToSpeech(context) { status -> onTtsInit(status) }
+        }
+
+        startFetchWorker()
+        startPlayWorker()
+    }
+
+    // Queries installed TTS engines and picks one that looks like a local
+    // Piper/Sherpa-based engine (VoxSherpa, SherpaTTS, or similar forks).
+    // Matched by package-name substring rather than one hardcoded exact ID,
+    // since the exact appId varies by build/fork and a wrong hardcoded
+    // string would silently fail to bind. Logs every installed engine it
+    // finds so a mismatch can be diagnosed and the match list adjusted.
+    private fun pickPreferredEnginePackage(context: Context): String? {
+        return try {
+            val installed = context.packageManager
+                .queryIntentServices(Intent(TextToSpeech.Engine.INTENT_ACTION_TTS_SERVICE), 0)
+                .map { it.serviceInfo.packageName }
+            CaptionLogger.log(TAG, "Installed TTS engines: ${installed.joinToString()}")
+            installed.firstOrNull { pkg ->
+                val p = pkg.lowercase()
+                p.contains("sherpa") || p.contains("piper") || p.contains("voxsherpa") || p.contains("ttsengine")
+            }
+        } catch (e: Exception) {
+            CaptionLogger.log(TAG, "Engine enumeration failed: ${e.message}")
+            null
+        }
+    }
+
+    private fun onTtsInit(status: Int) {
+        if (status == TextToSpeech.SUCCESS) {
                 try {
                     // Enumerate all available hi-IN voices, sorted alphabetically (matches Settings order)
-                    val hiVoices = tts?.voices
+                    val hiVoicesAll = tts?.voices
                         ?.filter { v ->
                             (v.locale.language == "hi" || v.locale.toLanguageTag().startsWith("hi")) &&
                             !v.isNetworkConnectionRequired
                         }
                         ?.sortedBy { it.name }
                         ?: emptyList()
+
+                    // VoxSherpa bundles BOTH Piper and Kokoro voices in one
+                    // engine — Kokoro must be excluded here even if the
+                    // engine itself was selected, because Kokoro is far too
+                    // slow for real-time dubbing on typical hardware
+                    // (documented ~2-3 minutes of compute per minute of
+                    // audio), whereas Piper (VITS-based) runs faster than
+                    // real-time on a phone CPU.
+                    val hiVoices = hiVoicesAll.filter { !it.name.lowercase().contains("kokoro") }
+                        .ifEmpty { hiVoicesAll }
+                    if (hiVoices.size < hiVoicesAll.size) {
+                        CaptionLogger.log(TAG, "Excluded ${hiVoicesAll.size - hiVoices.size} Kokoro voice(s) — too slow for real-time")
+                    }
+                    if (hiVoices.isNotEmpty() && hiVoices === hiVoicesAll &&
+                        hiVoicesAll.any { it.name.lowercase().contains("kokoro") }) {
+                        CaptionLogger.log(TAG, "Only Kokoro hi-IN voice(s) found — real-time dubbing may lag", CaptionLogger.LEVEL_WARN)
+                    }
 
                     CaptionLogger.log(TAG, "hi-IN voices found: ${hiVoices.size}")
                     hiVoices.forEachIndexed { i, v ->
@@ -396,13 +458,9 @@ object HindiTtsService {
 
                 ttsReady = true
                 CaptionLogger.log(TAG, "TTS READY — female=${voiceFemale?.name ?: "default"} male=${voiceMale?.name ?: "default"}")
-            } else {
-                CaptionLogger.log(TAG, "TTS init failed: $status")
-            }
+        } else {
+            CaptionLogger.log(TAG, "TTS init failed: $status")
         }
-
-        startFetchWorker()
-        startPlayWorker()
     }
 
     fun setEnabled(on: Boolean) {
@@ -835,7 +893,62 @@ object HindiTtsService {
 
 
 
+    // ── Local Piper/Kokoro TTS server (127.0.0.1:8766) ────────────────────────
+    // This is a loopback call to a Python process running on THIS SAME
+    // device (Termux/proot userland) — no internet involved at all, it's
+    // as offline as calling a function in-process. Preferred over Android's
+    // built-in TextToSpeech because: (1) no content-moderation muting of
+    // profanity, (2) the sample-rate bug and crude female pitch-shift bugs
+    // are fixed there (see hindi_tts_server_new.py), (3) it's the engine
+    // actually intended to produce the real voice — Android's local TTS
+    // is kept only as a fallback if this local server isn't running.
+    private const val LOCAL_TTS_SERVER_URL = "http://127.0.0.1:8766/tts"
+
+    private suspend fun fetchFromLocalPiperServer(item: FetchItem): File? = withContext(Dispatchers.IO) {
+        try {
+            val encodedText = URLEncoder.encode(item.text, "UTF-8")
+            val genderParam = if (item.gender == "female") "female" else "male"
+            // item.rate is a multiplier around 1.0 (0.5x-3.0x per finalRate
+            // clamp in speak()) — the server's own default speed is 1.8,
+            // tuned for Piper's natural pace, so scale relative to that
+            // rather than passing item.rate directly as an absolute value.
+            val speedParam = (1.8f * item.rate).coerceIn(0.5f, 4.0f)
+            val url = "$LOCAL_TTS_SERVER_URL?text=$encodedText&speed=$speedParam&gender=$genderParam"
+
+            val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                // Loopback to a process on the same device — should be near-
+                // instant to CONNECT even if synthesis itself takes a couple
+                // seconds, so a short connect timeout is safe and lets us
+                // fall back fast if the Termux server isn't running at all.
+                connectTimeout = 800
+                readTimeout    = 8_000
+                requestMethod  = "GET"
+            }
+            val code = conn.responseCode
+            if (code != 200) {
+                CaptionLogger.log(TAG, "Local TTS server returned $code — falling back to on-device TTS", CaptionLogger.LEVEL_WARN)
+                conn.disconnect()
+                return@withContext null
+            }
+            val bytes = conn.inputStream.readBytes()
+            conn.disconnect()
+            if (bytes.size < 100) return@withContext null
+
+            val outFile = File(cacheDir, "tts_srv_${UUID.randomUUID()}.wav")
+            outFile.writeBytes(bytes)
+            outFile
+        } catch (e: Exception) {
+            // Server not running, port not open, or timed out — this is the
+            // expected path whenever the Termux TTS server hasn't been
+            // started, not an error worth alarming about every single time.
+            CaptionLogger.log(TAG, "Local TTS server unreachable (${e.javaClass.simpleName}) — using on-device TTS")
+            null
+        }
+    }
+
     private suspend fun synthesizeToFile(item: FetchItem): File? {
+        fetchFromLocalPiperServer(item)?.let { return it }
+
         // Timeout on mutex acquire — if previous synthesis hung, don't wait forever.
         // Uses withLock (not manual lock()/unlock()) because withLock is
         // cancellation-safe: if withTimeoutOrNull cancels while lock() is
@@ -886,6 +999,110 @@ object HindiTtsService {
             }
         }
         return result
+    }
+
+    // ── SPLIT-SYNTHESIS: minimal WAV parsing/writing for stitching segments ──
+
+    private data class WavAudio(val channels: Int, val sampleRate: Int, val bitsPerSample: Int, val pcm: ByteArray)
+
+    // Scans RIFF chunks rather than assuming a fixed 44-byte header — some TTS
+    // engines emit extra chunks (LIST, fact, etc.) before "data".
+    private fun readWav(file: File): WavAudio? {
+        return try {
+            val b = file.readBytes()
+            if (b.size < 12 || String(b, 0, 4, Charsets.US_ASCII) != "RIFF" ||
+                String(b, 8, 4, Charsets.US_ASCII) != "WAVE") return null
+            var pos = 12
+            var channels = 1; var sampleRate = 22050; var bits = 16
+            var dataOff = -1; var dataLen = -1
+            while (pos + 8 <= b.size) {
+                val id = String(b, pos, 4, Charsets.US_ASCII)
+                val size = (b[pos+4].toInt() and 0xFF) or ((b[pos+5].toInt() and 0xFF) shl 8) or
+                           ((b[pos+6].toInt() and 0xFF) shl 16) or ((b[pos+7].toInt() and 0xFF) shl 24)
+                val dataStart = pos + 8
+                if (id == "fmt " && dataStart + 16 <= b.size) {
+                    channels    = (b[dataStart+2].toInt() and 0xFF) or ((b[dataStart+3].toInt() and 0xFF) shl 8)
+                    sampleRate  = (b[dataStart+4].toInt() and 0xFF) or ((b[dataStart+5].toInt() and 0xFF) shl 8) or
+                                  ((b[dataStart+6].toInt() and 0xFF) shl 16) or ((b[dataStart+7].toInt() and 0xFF) shl 24)
+                    bits        = (b[dataStart+14].toInt() and 0xFF) or ((b[dataStart+15].toInt() and 0xFF) shl 8)
+                } else if (id == "data") {
+                    dataOff = dataStart; dataLen = size
+                }
+                pos = dataStart + size + (size and 1) // chunks are word-aligned
+            }
+            if (dataOff < 0 || dataLen < 0 || dataOff + dataLen > b.size) return null
+            WavAudio(channels, sampleRate, bits, b.copyOfRange(dataOff, dataOff + dataLen))
+        } catch (_: Exception) { null }
+    }
+
+    private fun writeWav(file: File, fmt: WavAudio, pcm: ByteArray) {
+        val byteRate   = fmt.sampleRate * fmt.channels * fmt.bitsPerSample / 8
+        val blockAlign = fmt.channels * fmt.bitsPerSample / 8
+        val header = java.nio.ByteBuffer.allocate(44).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        header.put("RIFF".toByteArray(Charsets.US_ASCII)); header.putInt(36 + pcm.size)
+        header.put("WAVE".toByteArray(Charsets.US_ASCII))
+        header.put("fmt ".toByteArray(Charsets.US_ASCII)); header.putInt(16)
+        header.putShort(1) // PCM
+        header.putShort(fmt.channels.toShort())
+        header.putInt(fmt.sampleRate)
+        header.putInt(byteRate)
+        header.putShort(blockAlign.toShort())
+        header.putShort(fmt.bitsPerSample.toShort())
+        header.put("data".toByteArray(Charsets.US_ASCII)); header.putInt(pcm.size)
+        file.outputStream().use { out -> out.write(header.array()); out.write(pcm) }
+    }
+
+    // Cuts `text` at the MIDPOINT of every recognized profanity word so no
+    // single segment contains the whole word. Repeats for multiple
+    // occurrences in the same sentence.
+    private fun splitAtProfanityMidpoints(text: String): List<String> {
+        var remaining = text
+        val segments = mutableListOf<String>()
+        var guard = 0
+        while (guard++ < 20) {
+            var bestIdx = -1; var bestWord = ""
+            for (word in PROFANITY_RESPELL_WORDS) {
+                val idx = remaining.indexOf(word)
+                if (idx >= 0 && (bestIdx == -1 || idx < bestIdx)) { bestIdx = idx; bestWord = word }
+            }
+            if (bestIdx == -1) break
+            val cut = bestIdx + (bestWord.length / 2).coerceAtLeast(1)
+            segments.add(remaining.substring(0, cut))
+            remaining = remaining.substring(cut)
+        }
+        if (remaining.isNotBlank() || segments.isEmpty()) segments.add(remaining)
+        return segments.filter { it.isNotBlank() }
+    }
+
+    // Synthesizes each segment as its own TTS call, then concatenates the
+    // resulting PCM audio into one continuous WAV written to outFile.
+    // If ANY segment still comes back empty (meaning the filter operates
+    // below word-boundary granularity), the whole attempt fails cleanly.
+    private suspend fun synthesizeSplitAndMerge(segments: List<String>, outFile: File): Boolean {
+        val localTts = tts ?: return false
+        val pcmChunks = mutableListOf<ByteArray>()
+        var fmt: WavAudio? = null
+        for (seg in segments) {
+            val tmp = File(cacheDir, "tts_split_${UUID.randomUUID()}.wav")
+            val id = UUID.randomUUID().toString()
+            val deferred = CompletableDeferred<Unit>()
+            pendingUtterances[id] = { deferred.complete(Unit) }
+            val result = localTts.synthesizeToFile(seg, null, tmp, id)
+            if (result != TextToSpeech.SUCCESS) {
+                pendingUtterances.remove(id); tmp.delete(); return false
+            }
+            withTimeoutOrNull(8_000L) { deferred.await() } ?: run { pendingUtterances.remove(id) }
+            val wav = readWav(tmp)
+            tmp.delete()
+            if (wav == null || wav.pcm.size < 100) return false
+            if (fmt == null) fmt = wav
+            pcmChunks.add(wav.pcm)
+        }
+        val f = fmt ?: return false
+        if (pcmChunks.isEmpty()) return false
+        val merged = pcmChunks.reduce { a, b -> a + b }
+        writeWav(outFile, f, merged)
+        return outFile.exists() && outFile.length() > 100
     }
 
     private suspend fun synthesizeToFileInner(item: FetchItem): File? =
@@ -1025,6 +1242,28 @@ object HindiTtsService {
                                 recovered = true
                             } else {
                                 CaptionLogger.log(TAG, "TTS-PROFANITY-RESPELL still empty — engine is muting this regardless of spelling", CaptionLogger.LEVEL_ERROR)
+                            }
+                        }
+                    }
+
+                    // Step 3: SPLIT-SYNTHESIS — respelling didn't survive the
+                    // engine's own text normalizer (it almost certainly strips
+                    // zero-width characters before running its filter check).
+                    // Instead, cut the sentence into two pieces right through
+                    // the MIDDLE of the profane word and synthesize each half
+                    // as a separate TTS call. Neither half contains the whole
+                    // recognizable word, so neither should individually trip
+                    // the filter — then the two resulting WAV files are
+                    // concatenated back into one continuous line of audio.
+                    if (!recovered) {
+                        val segments = splitAtProfanityMidpoints(safeText)
+                        if (segments.size > 1) {
+                            val merged = synthesizeSplitAndMerge(segments, outFile)
+                            if (merged) {
+                                CaptionLogger.log(TAG, "TTS-SPLIT-SYNTHESIS succeeded: '$safeText' → ${segments.size} segments")
+                                recovered = true
+                            } else {
+                                CaptionLogger.log(TAG, "TTS-SPLIT-SYNTHESIS still failed — engine mutes at a level below word-boundary text", CaptionLogger.LEVEL_ERROR)
                             }
                         }
                     }
@@ -1353,4 +1592,4 @@ object HindiTtsService {
 
         return t
     }
-} 
+}
