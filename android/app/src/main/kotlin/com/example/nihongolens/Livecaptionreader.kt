@@ -307,7 +307,22 @@ class LiveCaptionReader : AccessibilityService() {
     // ── Window reader ─────────────────────────────────────────────────────────
 
     private fun readWindow(): String? {
-        val wins = try { windows } catch (_: Exception) { return null }
+        // CRITICAL FIX: `windows` can throw transiently (display/config changes,
+        // IME opening/closing, binder hiccups). PREVIOUSLY this early-returned null
+        // WITHOUT going through the LC-gone grace/confirm state machine below —
+        // meaning lcGoneMs/lcVisible never advanced while it kept throwing, and the
+        // reader silently froze forever with zero log output (no error, no confirm).
+        // NOW: an exception here is treated exactly like "LC window not found" so
+        // grace/confirm still progresses, and it's logged (throttled) for visibility.
+        val wins = try { windows } catch (e: Exception) {
+            val nowMs = System.currentTimeMillis()
+            if (nowMs - lastWindowsExcLogMs > 5_000L) {
+                lastWindowsExcLogMs = nowMs
+                CaptionLogger.log(TAG, "windows() threw: ${e.javaClass.simpleName}: ${e.message}",
+                    CaptionLogger.LEVEL_WARN)
+            }
+            return handleLcGoneOrAbsent()
+        }
 
         var root: AccessibilityNodeInfo? = null
         wins?.forEach { w ->
@@ -317,39 +332,51 @@ class LiveCaptionReader : AccessibilityService() {
         }
 
         if (root == null) {
-            if (lcVisible) {
-                val nowMs = System.currentTimeMillis()
-                if (lcGoneMs == 0L) {
-                    // First null read — start grace timer, don't reset yet
-                    lcGoneMs = nowMs
-                    CaptionLogger.log(TAG, "LC gone (grace period started)")
-                    return null
-                }
-                val goneForMs = nowMs - lcGoneMs
-                if (goneForMs < LC_GONE_GRACE_MS) {
-                    // Still within grace period — LC may reappear (app UI, notif bar etc.)
-                    // Keep translating and speaking whatever is in the queues
-                    return null
-                }
-                // Grace period expired — LC genuinely gone (video ended / paused)
-                lcVisible = false
-                lcGoneMs  = 0L
-                lastRawFull = ""; lastEnqueued = ""; lastSentText = ""
-                lastEnqueuedSents.clear()
-                pendingJob?.cancel(); pendingJob = null
-                sentenceTimerJob?.cancel(); sentenceTimerJob = null
-                sentenceBuffer = ""; lastBufferEnqueued = ""
-                lastEnqueuedWordCount = 0; lastEnqueuedText = ""
-                lastSubmitTotalWords = 0; lastSubmitMs = 0L
-                CaptionLogger.log(TAG, "LC gone (grace ${goneForMs}ms — confirmed)")
-                // NOTE: queue and TTS NOT cleared — FIFO backlog finishes playing
-                // Only explicit stop() / onDestroy clears queues
-            } else {
-                lcGoneMs = 0L  // already not visible, reset grace timer
-            }
-            return null
+            return handleLcGoneOrAbsent()
         }
-        // LC window found — cancel any pending gone timer
+        return readWindowFound(root)
+    }
+
+    private var lastWindowsExcLogMs = 0L
+
+    // Shared LC-gone grace/confirm state machine — reached whether the LC window
+    // is simply absent from windows[] OR windows() itself threw an exception.
+    private fun handleLcGoneOrAbsent(): String? {
+        if (lcVisible) {
+            val nowMs = System.currentTimeMillis()
+            if (lcGoneMs == 0L) {
+                // First null read — start grace timer, don't reset yet
+                lcGoneMs = nowMs
+                CaptionLogger.log(TAG, "LC gone (grace period started)")
+                return null
+            }
+            val goneForMs = nowMs - lcGoneMs
+            if (goneForMs < LC_GONE_GRACE_MS) {
+                // Still within grace period — LC may reappear (app UI, notif bar etc.)
+                // Keep translating and speaking whatever is in the queues
+                return null
+            }
+            // Grace period expired — LC genuinely gone (video ended / paused)
+            lcVisible = false
+            lcGoneMs  = 0L
+            lastRawFull = ""; lastEnqueued = ""; lastSentText = ""
+            lastEnqueuedSents.clear()
+            pendingJob?.cancel(); pendingJob = null
+            sentenceTimerJob?.cancel(); sentenceTimerJob = null
+            sentenceBuffer = ""; lastBufferEnqueued = ""
+            lastEnqueuedWordCount = 0; lastEnqueuedText = ""
+            lastSubmitTotalWords = 0; lastSubmitMs = 0L
+            CaptionLogger.log(TAG, "LC gone (grace ${goneForMs}ms — confirmed)")
+            // NOTE: queue and TTS NOT cleared — FIFO backlog finishes playing
+            // Only explicit stop() / onDestroy clears queues
+        } else {
+            lcGoneMs = 0L  // already not visible, reset grace timer
+        }
+        return null
+    }
+
+    // LC window found — cancel any pending gone timer, process the caption text
+    private fun readWindowFound(root: AccessibilityNodeInfo): String? {
         lcGoneMs = 0L
 
         val nodes = mutableListOf<String>()
@@ -370,7 +397,6 @@ class LiveCaptionReader : AccessibilityService() {
         // No change — nothing to process
         if (full == lastRawFull) return null
 
-        val prev    = lastRawFull
         lastRawFull = full
 
         // KEY FIX: Return the FULL window text to schedule(), not just the delta.
