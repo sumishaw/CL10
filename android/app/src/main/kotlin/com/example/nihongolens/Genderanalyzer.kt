@@ -323,12 +323,13 @@ object GenderAnalyzer {
             lastStatus = "MEDIA audio → $maj (F0=${f0.toInt()}Hz)"
             CaptionLogger.log(TAG, ">>> Gender SWITCHED to $maj F0=${f0.toInt()}Hz <<<")
             Log.d(TAG, "Gender→$maj F0=${f0.toInt()} rms=${rms.toInt()}")
-            // New speaker confirmed — reset all speaker-specific state
+            // New speaker confirmed — switch voice, seed new gender's F0 buffer
             voiceTypeF0History.clear()
-            HindiTtsService.currentMeasuredF0 = 0f
-            HindiTtsService.resetSentenceF0()  // new speaker — clear sentence F0 buffer
+            // Seed the new gender's F0 buffer with current measurement
+            // rather than clearing to zero (which causes pitch=1.0 for 1-2 sentences)
+            HindiTtsService.currentMeasuredF0 = f0.takeIf { it > 60f } ?: 0f
+            HindiTtsService.seedSentenceF0(f0, maj)  // smooth gender transition
             // Reset Hindi dedup so new speaker's first sentence is never skipped
-            // (new speaker may say similar words to previous speaker)
             LiveCaptionReader.instance?.resetHindiDedup()
         }
 
