@@ -76,6 +76,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   String  _logStats         = '';
   bool    _logAutoScroll    = true;
   String  _downloadStatus   = '';
+  String  _lockedLang       = '';   // '' = auto
   String  _genderDetected   = 'male';
   String  _genderSelected   = 'auto';
   bool    _genderAnalyzerOn = false;
@@ -595,6 +596,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
 
 
+  Future<void> _setLockedLang(String lang) async {
+    await _ch.invokeMethod('setLockedLang', lang);
+    if (mounted) setState(() => _lockedLang = lang);
+  }
+
+  Future<void> _loadLockedLang() async {
+    final lang = await _ch.invokeMethod<String>('getLockedLang') ?? '';
+    if (mounted) setState(() => _lockedLang = lang);
+  }
+
   Future<void> _downloadLogs() async {
     try {
       final path = await _ch.invokeMethod<String>('downloadLogs') ?? '';
@@ -624,6 +635,35 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       final textMatch = _logFilter.isEmpty || l.toLowerCase().contains(_logFilter.toLowerCase());
       return catMatch && textMatch;
     }).toList();
+  }
+
+  Widget _langChip(String label, String code, IconData? icon) {
+    final isSelected = _lockedLang == code;
+    return GestureDetector(
+      onTap: () => _setLockedLang(code),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 150),
+        margin: const EdgeInsets.only(right: 6),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        decoration: BoxDecoration(
+          color: isSelected ? Colors.blueAccent.withValues(alpha: 0.25) : Colors.white.withValues(alpha: 0.07),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(
+            color: isSelected ? Colors.blueAccent : Colors.white24,
+            width: isSelected ? 1.5 : 0.8,
+          ),
+        ),
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
+          if (icon != null) ...[Icon(icon, size: 12, color: isSelected ? Colors.blueAccent : Colors.white54), const SizedBox(width: 4)],
+          Text(label, style: TextStyle(
+            color: isSelected ? Colors.blueAccent : Colors.white70,
+            fontSize: 11,
+            fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+          )),
+          if (isSelected) ...[const SizedBox(width: 4), const Icon(Icons.lock, size: 10, color: Colors.blueAccent)],
+        ]),
+      ),
+    );
   }
 
   Widget _buildHeader() => Row(children: [
@@ -895,6 +935,54 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Widget _buildLangSelector() => Column(
     crossAxisAlignment: CrossAxisAlignment.start,
     children: [
+      // ── LC Language Lock ──────────────────────────────────────────────
+      Padding(
+        padding: const EdgeInsets.fromLTRB(0, 0, 0, 8),
+        child: Row(children: [
+          const Icon(Icons.lock_outline, color: Colors.white38, size: 13),
+          const SizedBox(width: 5),
+          const Text('Lock Caption Language',
+              style: TextStyle(color: Colors.white54, fontSize: 12)),
+          const Spacer(),
+          if (_lockedLang.isNotEmpty)
+            GestureDetector(
+              onTap: () => _setLockedLang(''),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                decoration: BoxDecoration(
+                  color: Colors.orange.withValues(alpha: 0.15),
+                  borderRadius: BorderRadius.circular(4),
+                  border: Border.all(color: Colors.orange.withValues(alpha: 0.5)),
+                ),
+                child: const Text('Unlock Auto',
+                    style: TextStyle(color: Colors.orange, fontSize: 10)),
+              ),
+            ),
+        ]),
+      ),
+      SizedBox(
+        height: 34,
+        child: ListView(
+          scrollDirection: Axis.horizontal,
+          children: [
+            _langChip('AUTO', ''),
+            _langChip('English', 'latin_en'),
+            _langChip('Chinese', 'zh'),
+            _langChip('Japanese', 'ja'),
+            _langChip('Korean', 'ko'),
+            _langChip('French', 'latin_foreign'),
+            _langChip('Arabic', 'ar'),
+            _langChip('Russian', 'ru'),
+            _langChip('Hindi', 'hi'),
+            _langChip('Spanish', 'latin_foreign'),
+            _langChip('German', 'latin_foreign'),
+            _langChip('Turkish', 'latin_foreign'),
+            _langChip('Portuguese', 'latin_foreign'),
+            _langChip('Indonesian', 'latin_foreign'),
+          ],
+        ),
+      ),
+      const SizedBox(height: 10),
       const Text('Translate to',
           style: TextStyle(color: Colors.white54, fontSize: 12, fontWeight: FontWeight.bold)),
       const SizedBox(height: 8),
