@@ -41,7 +41,7 @@ object GenderAnalyzer {
     // Even with HIST=12, rapid pitch variation (music, noise) can still flip quickly
     // Raised from 3s → 12s: prevents same speaker's voice flipping during
     // brief music/silence gaps between sentences (music F0 reads as MALE)
-    private const val MIN_SWITCH_INTERVAL_MS = 12_000L
+    private const val MIN_SWITCH_INTERVAL_MS = 2_000L   // fast gender switch (male↔female)
 
     @Volatile var enabled    = false
     @Volatile var lastStatus = "waiting for screen capture permission"
@@ -259,17 +259,24 @@ object GenderAnalyzer {
     private var sustainedHighF0Frames = 0
     private var emotionFrameCount = 0
 
-    // ── F0 Contour tracking (for SSML prosody mirroring) ─────────────────────
-    // We track F0 at 3 key points in each sentence window:
-    //   startF0: average of first 8 frames (how the speaker begins the phrase)
-    //   peakF0:  highest sustained F0 in the window (where energy/stress peaks)
-    //   endF0:   average of last 8 frames (how the phrase ends — falling/rising)
-    // These 3 points define the pitch CONTOUR of the original utterance, which
-    // we then map to SSML <prosody pitch> tags so the Hindi TTS follows the
-    // same intonation shape — rising, falling, peaked, or flat.
-    private val contourBuffer  = ArrayDeque<Float>(80)  // ~10s of F0 frames
-    private var contourPeak    = 0f
-    @Volatile var lastContourStartF0: Float = 0f   // read by HindiTtsService
+    // ── Multi-point F0+RMS contour tracking ──────────────────────────────────
+    // Captures 10 evenly-spaced F0 AND RMS samples across the sentence window.
+    // F0 samples → per-word pitch variation (not just 3-point start/peak/end)
+    // RMS samples → per-word duration estimation (loud=stressed=longer)
+    // Both are written to HindiTtsService at sentence flush time.
+    //
+    // 10 points gives ~10x pitch resolution vs the old 3-point approach —
+    // each word maps to its own measured F0 and energy level from the original.
+    private val contourF0Buffer  = ArrayDeque<Float>(120) // raw F0 frames per sentence
+    private val contourRmsBuffer = ArrayDeque<Float>(120) // raw RMS frames per sentence
+    private var contourPeak      = 0f
+
+    // Published to HindiTtsService at flushContour()
+    // 10-point curves sampled from the sentence window
+    val capturedF0Curve  = FloatArray(10)   // F0 at 10 time positions
+    val capturedRmsCurve = FloatArray(10)   // RMS at 10 time positions (for duration)
+    // Legacy 3-point fields kept for backward compat
+    @Volatile var lastContourStartF0: Float = 0f
     @Volatile var lastContourPeakF0:  Float = 0f
     @Volatile var lastContourEndF0:   Float = 0f
 
@@ -317,16 +324,15 @@ object GenderAnalyzer {
             // New speaker confirmed — reset all speaker-specific state
             voiceTypeF0History.clear()
             HindiTtsService.currentMeasuredF0 = 0f
-            HindiTtsService.onSpeakerChanged()  // unlock F0 baseline for new speaker
+            HindiTtsService.updateEmaF0(f0, maj)  // seed EMA with new speaker's F0
         }
 
         // ── Voice Type classification ─────────────────────────────────────────
-        // ── F0 Contour: accumulate only voiced speech frames ────────────────
-        // RMS guard: only add to contour buffer when a real voice is detected
-        // Music/silence frames have low RMS and corrupt the start/peak/end measurements
+        // ── Multi-point contour: accumulate F0 and RMS per voiced frame ────────
         if (f0 > 0f && rms >= 150f) {
-            contourBuffer.addLast(f0)
-            if (contourBuffer.size > 80) contourBuffer.removeFirst()
+            contourF0Buffer.addLast(f0)
+            contourRmsBuffer.addLast(rms)
+            if (contourF0Buffer.size > 120) { contourF0Buffer.removeFirst(); contourRmsBuffer.removeFirst() }
             if (f0 > contourPeak) contourPeak = f0
         }
 
@@ -350,9 +356,9 @@ object GenderAnalyzer {
             if (voicedOnly.size >= 4) {
                 val avgF0 = voicedOnly.average().toFloat()
                 HindiTtsService.currentMeasuredF0 = avgF0
-                // Accumulate frames toward locking the speaker's baseline F0
-                // Once locked, the same speaker's TTS pitch stays stable across sentences
-                HindiTtsService.tryLockSpeakerF0(avgF0, maj)
+                // Feed voiced-speech F0 into EMA — keeps same speaker's pitch stable
+                // across all their sentences without wild jumps from music/silence frames
+                HindiTtsService.updateEmaF0(avgF0, maj)
             }
         }
 
@@ -412,23 +418,48 @@ object GenderAnalyzer {
     // translation. Extracts the 3-point pitch contour from the accumulated F0
     // buffer and writes it to HindiTtsService for SSML generation.
     fun flushContour() {
-        val buf = contourBuffer.toList().filter { it > 0f }
-        if (buf.size < 10) return
-        val n = buf.size
-        val startF0 = buf.take(minOf(8, n/4)).average().toFloat()
-        val endF0   = buf.takeLast(minOf(8, n/4)).average().toFloat()
-        val peakF0  = contourPeak.takeIf { it > 0f } ?: buf.max()
-        lastContourStartF0 = startF0
-        lastContourPeakF0  = peakF0
-        lastContourEndF0   = endF0
-        HindiTtsService.capturedStartF0 = startF0
-        HindiTtsService.capturedPeakF0  = peakF0
-        HindiTtsService.capturedEndF0   = endF0
+        val f0Buf  = contourF0Buffer.toList()
+        val rmsBuf = contourRmsBuffer.toList()
+        if (f0Buf.size < 6) return
+        val n = f0Buf.size
+
+        // Sample 10 evenly-spaced points from the sentence window
+        // Each point i covers 1/10th of the sentence duration
+        for (i in 0..9) {
+            val lo = (i * n / 10)
+            val hi = ((i + 1) * n / 10).coerceAtMost(n)
+            if (lo < hi) {
+                capturedF0Curve[i]  = f0Buf.subList(lo, hi).average().toFloat()
+                capturedRmsCurve[i] = rmsBuf.subList(lo, hi).average().toFloat()
+            } else {
+                capturedF0Curve[i]  = if (i > 0) capturedF0Curve[i-1] else (f0Buf.average().toFloat())
+                capturedRmsCurve[i] = if (i > 0) capturedRmsCurve[i-1] else (rmsBuf.average().toFloat())
+            }
+        }
+
+        // Legacy 3-point fields (still used as fallback)
+        lastContourStartF0 = capturedF0Curve[0]
+        lastContourPeakF0  = capturedF0Curve.max()
+        lastContourEndF0   = capturedF0Curve[9]
+
+        // Publish to HindiTtsService
+        HindiTtsService.capturedStartF0  = lastContourStartF0
+        HindiTtsService.capturedPeakF0   = lastContourPeakF0
+        HindiTtsService.capturedEndF0    = lastContourEndF0
+        capturedF0Curve.copyInto(HindiTtsService.capturedF0Curve)
+        capturedRmsCurve.copyInto(HindiTtsService.capturedRmsCurve)
+
+        val shape = when {
+            lastContourEndF0 > lastContourStartF0 * 1.05f -> "↑RISING"
+            lastContourEndF0 < lastContourStartF0 * 0.95f -> "↓FALLING"
+            else -> "→FLAT"
+        }
         CaptionLogger.log("GenderAnalyzer",
-            "CONTOUR start=${startF0.toInt()} peak=${peakF0.toInt()} end=${endF0.toInt()}Hz " +
-            if (endF0 > startF0 * 1.05f) "↑RISING" else if (endF0 < startF0 * 0.95f) "↓FALLING" else "→FLAT")
+            "CONTOUR-10pt [${capturedF0Curve.map{it.toInt()}.joinToString(",")}] $shape")
+
         // Reset for next sentence
-        contourBuffer.clear()
+        contourF0Buffer.clear()
+        contourRmsBuffer.clear()
         contourPeak = 0f
     }
 
