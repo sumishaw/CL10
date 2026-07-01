@@ -327,6 +327,9 @@ object GenderAnalyzer {
             voiceTypeF0History.clear()
             HindiTtsService.currentMeasuredF0 = 0f
             HindiTtsService.resetSentenceF0()  // new speaker — clear sentence F0 buffer
+            // Reset Hindi dedup so new speaker's first sentence is never skipped
+            // (new speaker may say similar words to previous speaker)
+            LiveCaptionReader.instance?.resetHindiDedup()
         }
 
         // ── Voice Type classification ─────────────────────────────────────────
