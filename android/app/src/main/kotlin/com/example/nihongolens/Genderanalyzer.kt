@@ -499,6 +499,49 @@ object GenderAnalyzer {
         if (rmsMean < 400f && f0Std < 25f)
             return HindiTtsService.Emotion.WHISPERY
 
+        // ── New expressive emotions ───────────────────────────────────────────
+
+        // SHOUTING: very high RMS + fast rate + not too high pitch (yelling, not fearful)
+        if (rmsMean > 4000f && highEnergy >= 6 && f0Std > 15f && f0Mean < 210f)
+            return HindiTtsService.Emotion.SHOUTING
+
+        // PANICKING: extremely fast + very high pitch + high energy together
+        if (rising >= 5 && f0Mean > 220f && highEnergy >= 4 && rmsMean > 2000f)
+            return HindiTtsService.Emotion.PANICKING
+
+        // CRYING: high pitch + irregular/unstable F0 (voice breaks) + moderate pace
+        // F0 instability (high std relative to mean) is the key marker
+        if (f0Mean > 175f && f0Std > 35f && highEnergy < 4 && rmsMean in 500f..2500f)
+            return HindiTtsService.Emotion.CRYING
+
+        // SOBBING: very low F0, very slow, low energy — deep grief
+        if (f0Mean < 120f && falling >= 4 && rmsMean < 700f)
+            return HindiTtsService.Emotion.SOBBING
+
+        // LAUGHING: rapid rhythmic energy bursts + high pitch
+        if (highEnergy >= 3 && rising >= 3 && f0Mean > 190f && f0Std > 20f)
+            return HindiTtsService.Emotion.LAUGHING
+
+        // PLEADING: rapidly rising F0, moderate-high energy, urgent
+        if (rising >= 4 && f0Mean in 155f..210f && rmsMean in 1000f..3500f)
+            return HindiTtsService.Emotion.PLEADING
+
+        // COMMANDING: very low F0, very low variance (steady authoritative voice)
+        if (f0Mean < 105f && f0Std < 12f && rmsMean > 1200f)
+            return HindiTtsService.Emotion.COMMANDING
+
+        // WHINING: high pitch, falling, low-moderate energy (complaint tone)
+        if (f0Mean > 180f && falling >= 3 && rmsMean < 1500f && f0Std < 25f)
+            return HindiTtsService.Emotion.WHINING
+
+        // TAUNTING: mid-high pitch, slow variation, moderate energy
+        if (f0Mean in 160f..200f && f0Std in 15f..30f && highEnergy < 3 && rising >= 2)
+            return HindiTtsService.Emotion.TAUNTING
+
+        // CONSOLING: low-mid pitch, falling, warm, soft
+        if (f0Mean in 100f..155f && falling >= 2 && rmsMean < 1000f && f0Std < 18f)
+            return HindiTtsService.Emotion.CONSOLING
+
         return HindiTtsService.Emotion.NEUTRAL
     }
 
