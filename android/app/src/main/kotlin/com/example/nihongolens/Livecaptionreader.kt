@@ -578,6 +578,9 @@ class LiveCaptionReader : AccessibilityService() {
         lastSubmitTotalWords  = currentTotalWords
         lastSubmitMs          = System.currentTimeMillis()
         sentenceBuffer        = ""
+        // Flush the F0 contour captured during this sentence window to
+        // HindiTtsService — used to build SSML that mirrors intonation shape
+        GenderAnalyzer.flushContour()
         enqueue(text)
     }
 
