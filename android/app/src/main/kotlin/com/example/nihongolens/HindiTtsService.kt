@@ -396,15 +396,14 @@ object HindiTtsService {
         // before GenderAnalyzer has gathered enough samples.
         val hasSpecificVoice = if (isFemale) voiceFemale != null else voiceMale != null
 
-        // Use STABLE (locked) pitch ratio — same speaker always gets the same
-        // base pitch across all sentences. Prevents same person sounding like
-        // a different person between sentences due to F0 rolling average drift.
+        // EMA-smoothed pitch ratio — same speaker always gets the same base pitch.
+        // stablePitchRatio() reads from emaF0 (slow-changing EMA) not raw currentMeasuredF0.
         val basePitch: Float = when {
-            lockedSpeakerF0 > 0f -> stablePitchRatio(isFemale)  // locked: fully consistent
+            emaF0 > 0f             -> stablePitchRatio(isFemale)          // EMA stable: fully consistent
             currentMeasuredF0 > 0f -> exactPitchRatio(currentMeasuredF0, isFemale)  // accumulating
-            hasSpecificVoice -> 1.0f       // no data, voice handles gender
-            isFemale -> 1.15f              // no data, no specific voice: approximate
-            else -> 0.88f
+            hasSpecificVoice       -> 1.0f       // no data, voice handles gender
+            isFemale               -> 1.15f      // no data, no specific voice
+            else                   -> 0.88f
         }
 
         val finalPitch = (basePitch * pitchMult).coerceIn(0.5f, 2.0f)
