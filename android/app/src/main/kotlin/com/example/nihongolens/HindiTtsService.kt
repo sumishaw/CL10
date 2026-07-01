@@ -248,9 +248,17 @@ object HindiTtsService {
     // Android TTS "natural" reference F0 — the approximate average speaking
     // pitch of the underlying recorded voice corpus when pitch=1.0 (no shift).
     // These are empirical reference points for Google TTS hi-IN voices.
-    // Calibrated so 242Hz female → pitch≈1.42 (matches real-world measured example)
-    private const val TTS_NATURAL_F0_FEMALE = 170f  // Voice II reference pitch
-    private const val TTS_NATURAL_F0_MALE   = 95f   // Voice IV reference pitch (proportional)
+    // Google TTS hi-IN Voice baselines (empirically measured):
+    // Female (Voice II): natural speaking pitch ~200Hz
+    // Male (Voice IV): natural speaking pitch ~120Hz
+    //
+    // These are the actual recorded corpus pitches. Getting these right is
+    // critical — wrong baseline = ratio too high/low → unnatural voice.
+    // 
+    // Pitch ratio is then CLAMPED to 0.75–1.45 to stay in natural range.
+    // Android TTS sounds robotic above 1.6 regardless of input.
+    private const val TTS_NATURAL_F0_FEMALE = 200f  // Voice II natural F0
+    private const val TTS_NATURAL_F0_MALE   = 120f  // Voice IV natural F0
 
     /**
      * Exact continuous pitch ratio: captured_F0 / TTS_natural_F0.
@@ -266,7 +274,9 @@ object HindiTtsService {
     fun exactPitchRatio(measuredF0: Float, isFemale: Boolean): Float {
         if (measuredF0 <= 0f) return 1.0f  // no measurement yet — neutral
         val naturalF0 = if (isFemale) TTS_NATURAL_F0_FEMALE else TTS_NATURAL_F0_MALE
-        return (measuredF0 / naturalF0).coerceIn(0.55f, 1.95f)
+        // Natural-sounding range: 0.75–1.45
+        // Below 0.75 or above 1.45: Android TTS sounds robotic/squeaky
+        return (measuredF0 / naturalF0).coerceIn(0.75f, 1.45f)
     }
 
     // Kept for log labeling only — classifies the ratio into a human-readable
@@ -491,13 +501,13 @@ object HindiTtsService {
 
         // Per-sentence locked median — same voice throughout each sentence.
         // stablePitchRatio() reads from sentenceF0 (locked median per sentence).
-        // Per-sentence locked median F0 — ONE stable pitch for the whole sentence
+        // Per-sentence locked median — one stable pitch for the whole sentence.
+        // When no F0 measured yet: use 1.0 (natural TTS voice without shift).
+        // This prevents the first sentence sounding different from subsequent ones.
         val basePitch: Float = when {
-            sentenceF0 > 0f        -> stablePitchRatio(isFemale)   // locked median: fully consistent
+            sentenceF0 > 0f        -> stablePitchRatio(isFemale)
             currentMeasuredF0 > 0f -> exactPitchRatio(currentMeasuredF0, isFemale)
-            hasSpecificVoice       -> 1.0f
-            isFemale               -> 1.15f
-            else                   -> 0.88f
+            else                   -> 1.0f  // no data: natural voice, no shift
         }
 
         // Apply VoiceProfile-derived adjustments on top of base pitch/rate
@@ -512,7 +522,7 @@ object HindiTtsService {
             voiceTextureEmotion!! else currentEmotion
         val (pitchMult2, rateMult2) = emotionPitchRate(effectiveEmotion)
 
-        val finalPitch = (profilePitch * pitchMult2).coerceIn(0.5f, 2.0f)
+        val finalPitch = (profilePitch * pitchMult2).coerceIn(0.75f, 1.45f)  // stay in natural range
         val finalRate  = (profileRate  * rateMult2).coerceIn(0.5f, 3.0f)
 
         // Snapshot background music sequence at enqueue time for timing alignment
@@ -751,6 +761,22 @@ object HindiTtsService {
         }
     }
 
+    // Build SSML for a sentence.
+    //
+    // IMPORTANT: Android TTS does NOT smoothly glide between per-word
+    // <prosody pitch> values — it JUMPS instantly, creating a mechanical
+    // staircase effect that sounds robotic. This is an Android TTS engine
+    // limitation that no parameter tuning can fix.
+    //
+    // What DOES work naturally on Android TTS:
+    //   - ONE pitch for the whole sentence (smooth, consistent voice)
+    //   - Emotion-based pitch shift (sentence-level)
+    //   - <emphasis> for stress (subtle, sounds natural)
+    //   - <break> for pauses (works perfectly)
+    //   - ONE rate for the whole sentence
+    //
+    // The per-word pitch variation from the F0 contour is intentionally
+    // REMOVED here. It made the voice sound robotic, not expressive.
     private fun buildSsml(text: String, basePitch: Float,
                            startF0: Float, peakF0: Float, endF0: Float,
                            naturalF0: Float): String {
@@ -758,28 +784,10 @@ object HindiTtsService {
         fun esc(s: String) = android.text.Html.escapeHtml(s)
         fun pctStr(p: Int) = if (p >= 0) "+${p}%" else "${p}%"
 
-        val words = text.split(" ").filter { it.isNotBlank() }
-        val n = words.size
-        if (n == 0) return "<speak>${esc(text)}</speak>"
+        // ONE pitch for the entire sentence — the speaker's measured register
+        val pitchPct = ((basePitch - 1f) * 100f).toInt().coerceIn(-25, 45)
 
-        // Sentence base pitch from locked median
-        val baseRef = if (sentenceF0 > 0f) sentenceF0
-                      else if (currentMeasuredF0 > 0f) currentMeasuredF0
-                      else naturalF0
-        val basePct = ((basePitch - 1f) * 100f).toInt().coerceIn(-40, 70)
-
-        // No contour → single flat pitch for whole sentence (most consistent)
-        val hasMultiPoint = capturedF0Curve.any { it > 0f }
-        val hasContour    = startF0 > 0f || peakF0 > 0f || endF0 > 0f
-        if (!hasMultiPoint && !hasContour) {
-            return "<speak><prosody pitch='${pctStr(basePct)}'>${esc(text)}</prosody></speak>"
-        }
-
-        // ── RATE: ONE value for the whole sentence from VoiceAnalyzer ────────
-        // DO NOT vary rate per-word. Per-word rate from RMS creates a
-        // bell-curve slow-middle/fast-edges pattern on EVERY sentence
-        // because RMS always rises then falls (physics of speech).
-        // Instead: one measured rate for the whole sentence.
+        // ONE rate for the entire sentence — from measured syllable rate
         val sentenceRate: String = when {
             voiceProfile?.syllableRate ?: 0f > 6.5f -> "x-fast"
             voiceProfile?.syllableRate ?: 0f > 5.5f -> "fast"
@@ -788,43 +796,27 @@ object HindiTtsService {
             else                                     -> "medium"
         }
 
-        // ── PITCH: ±22% relative deviation per word (intonation shape) ───────
-        // MAX_DEVIATION bounds how far any word can stray from the sentence base.
-        // Keeps the same voice throughout while preserving natural intonation.
-        val MAX_DEV = 0.22f
+        val words = text.split(" ").filter { it.isNotBlank() }
+        val n = words.size
+        if (n == 0) return "<speak>${esc(text)}</speak>"
 
-        val sb = StringBuilder("<speak><prosody rate='$sentenceRate'>")
+        // Determine peak stress position from RMS curve
+        // Only ONE word gets emphasis (the actual peak) — not every other word
+        val hasRms = capturedRmsCurve.any { it > 0f }
+        val maxRmsPos = if (hasRms) capturedRmsCurve.indices.maxByOrNull { capturedRmsCurve[it] } ?: -1 else -1
+        val maxRmsVal = if (hasRms) capturedRmsCurve.max() else 0f
+        val stressWordIdx: Int = if (hasRms && maxRmsVal > 0f) {
+            // Map RMS peak position (0-9) to word index
+            (maxRmsPos.toFloat() / 9f * (n - 1)).toInt().coerceIn(0, n - 1)
+        } else -1
+
+        val sb = StringBuilder("<speak><prosody pitch='${pctStr(pitchPct)}' rate='$sentenceRate'>")
 
         words.forEachIndexed { i, word ->
-            val t        = i.toFloat() / (n - 1).coerceAtLeast(1)
-            val curvePos = (t * 9).toInt().coerceIn(0, 9)
+            // Stress: only at measured RMS peak (natural emphasis)
+            val isStressed = (i == stressWordIdx)
 
-            // Per-word pitch deviation (relative to sentence median, clamped)
-            val curveF0: Float = when {
-                hasMultiPoint && capturedF0Curve[curvePos] > 0f ->
-                    capturedF0Curve[curvePos]
-                hasContour -> {
-                    val sF0 = if (startF0 > 0f) startF0 else baseRef
-                    val pF0 = if (peakF0 > 0f) peakF0 else sF0
-                    val eF0 = if (endF0 > 0f) endF0 else sF0
-                    if (t <= 0.5f) sF0 + (pF0 - sF0) * (t * 2f)
-                    else           pF0 + (eF0 - pF0) * ((t - 0.5f) * 2f)
-                }
-                else -> baseRef
-            }
-
-            val deviation = ((curveF0 - baseRef) / baseRef.coerceAtLeast(1f))
-                .coerceIn(-MAX_DEV, MAX_DEV)
-            val wordPitch = basePitch * (1f + deviation)
-            val wordPct   = ((wordPitch - 1f) * 100f).toInt().coerceIn(-40, 70)
-
-            // Stress: only at measured RMS peak (not positional)
-            val isLocalPeak = hasMultiPoint &&
-                capturedRmsCurve[curvePos] / capturedRmsCurve.max().coerceAtLeast(1f) > 0.85f &&
-                (curvePos == 0 || capturedRmsCurve[curvePos] >= capturedRmsCurve[curvePos-1]) &&
-                (curvePos == 9 || capturedRmsCurve[curvePos] >= capturedRmsCurve[curvePos+1])
-
-            // Punctuation pauses
+            // Pauses from punctuation (these work well on Android TTS)
             val breakAfter = when (word.lastOrNull()) {
                 '.', '!', '?', '।', '॥' -> "<break time='180ms'/>"
                 ','                       -> "<break time='80ms'/>"
@@ -832,16 +824,20 @@ object HindiTtsService {
                 else                      -> ""
             }
 
-            sb.append("<prosody pitch='${pctStr(wordPct)}'>")
-            if (isLocalPeak) sb.append("<emphasis level='moderate'>${esc(word)}</emphasis>")
-            else             sb.append(esc(word))
-            sb.append("</prosody>$breakAfter")
+            if (isStressed) {
+                sb.append("<emphasis level='moderate'>${esc(word)}</emphasis>")
+            } else {
+                sb.append(esc(word))
+            }
+            sb.append(breakAfter)
             if (i < n - 1) sb.append(" ")
         }
 
         sb.append("</prosody></speak>")
         return sb.toString()
     }
+
+
 
 
 
@@ -888,20 +884,21 @@ object HindiTtsService {
             // Build SSML from captured F0 contour when available
             // SSML gives word-group level pitch variation instead of one flat pitch
             val naturalF0 = if (item.gender == "female") TTS_NATURAL_F0_FEMALE else TTS_NATURAL_F0_MALE
-            val hasCapturedContour = capturedStartF0 > 0f || capturedPeakF0 > 0f
+            // capturedF0Curve still used by VoiceAnalyzer for stress detection in buildSsml
             val inputText: String
             val inputBundle: android.os.Bundle?
 
-            // SSML safety: validate that text is safe for SSML before building
-            // Malformed SSML (bad chars, empty tags) causes TTS to hang/produce empty WAV
             val safeText = item.text
-                .replace("&", "and")   // & breaks SSML XML parsing
-                .replace("<", "")      // stray < breaks SSML
-                .replace(">", "")      // stray > breaks SSML
-                .trim()
+                .replace("&", "and")
+                .replace("<", "").replace(">", "").trim()
             if (safeText.isBlank()) return@withContext null
 
-            // Expressive emotions get special SSML texture (breaks, emphasis, contours)
+            // APPROACH: plain setPitch/setSpeechRate for normal speech
+            // This sounds MORE natural than SSML <prosody> per-word tags
+            // because Android TTS handles internal prosody smoothly,
+            // whereas SSML pitch tags JUMP between values (robotic staircase).
+            // Only expressive emotions (CRYING/SHOUTING etc.) use SSML
+            // for their break/emphasis texture effects.
             val expressiveSsml = emotionSsml(safeText, item.emotion,
                 run { val pct = ((item.pitch - 1f) * 100f).toInt()
                       if (pct >= 0) "+${pct}%" else "${pct}%" })
@@ -912,17 +909,11 @@ object HindiTtsService {
                     putInt(android.speech.tts.TextToSpeech.Engine.KEY_PARAM_STREAM, 3)
                 }
                 CaptionLogger.log(TAG, "SSML-EXPRESSIVE: ${item.emotion}")
-            } else if (hasCapturedContour) {
-                inputText = buildSsml(item.text, item.pitch,
-                    capturedStartF0, capturedPeakF0, capturedEndF0, naturalF0)
-                inputBundle = android.os.Bundle().apply {
-                    putInt(android.speech.tts.TextToSpeech.Engine.KEY_PARAM_STREAM, 3)
-                }
-                CaptionLogger.log(TAG, "SSML: start=${capturedStartF0.toInt()} " +
-                    "peak=${capturedPeakF0.toInt()} end=${capturedEndF0.toInt()}Hz")
             } else {
-                inputText   = item.text
+                // Plain text — setPitch and setSpeechRate set above handle prosody
+                inputText   = safeText
                 inputBundle = null
+                CaptionLogger.log(TAG, "PLAIN-TTS pitch=${String.format("%.2f", item.pitch)} rate=${String.format("%.2f", item.rate)}")
             }
 
             // Bridge Android TTS callback to coroutine
