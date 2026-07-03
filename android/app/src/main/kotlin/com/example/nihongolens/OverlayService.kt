@@ -145,14 +145,15 @@ class OverlayService : Service() {
 
         tv.text = text
         tv.animate().cancel()
-
-        if (subtitleHidden) {
-            // Text is tracked (so un-hiding shows it instantly) but not rendered
-            tv.visibility = View.GONE
-        } else {
-            tv.alpha = 1f
-            tv.visibility = View.VISIBLE
-        }
+        // Always VISIBLE — never GONE. This is the root view of a raw
+        // WindowManager-added window (WRAP_CONTENT height), not a view
+        // inside a normal layout. GONE here can collapse the window's own
+        // dimensions and doesn't trigger the relayout WindowManager needs,
+        // which is what caused the overlay to start "interrupting" again.
+        // alpha achieves the same visual result (invisible) without ever
+        // touching layout — same proven approach as fadeOut() below.
+        tv.visibility = View.VISIBLE
+        tv.alpha = if (subtitleHidden) 0f else 1f
 
         CaptionLogger.onOverlayTextSet(text, if (subtitleHidden) 0f else 1f, !subtitleHidden)
 
@@ -165,14 +166,9 @@ class OverlayService : Service() {
     private fun applyHiddenState() {
         if (!alive) return
         val tv = textView ?: return
-        if (subtitleHidden) {
-            tv.animate().cancel()
-            tv.visibility = View.GONE
-        } else if (tv.text.isNotBlank()) {
-            tv.animate().cancel()
-            tv.alpha = 1f
-            tv.visibility = View.VISIBLE
-        }
+        tv.animate().cancel()
+        tv.visibility = View.VISIBLE
+        tv.alpha = if (subtitleHidden) 0f else if (tv.text.isNotBlank()) 1f else 0f
     }
 
     private fun fadeOut() {
